@@ -19,6 +19,11 @@ https://github.com/MeshToolkit/MSTK/blob/master/LICENSE
 extern "C" {
 #endif
 
+  static int skip_side_set_attr_copy_enabled(void) {
+    const char *val = getenv("MSTK_SKIP_SIDE_SET_ATTR_COPY");
+    return (val && val[0] != '\0' && val[0] != '0');
+  }
+
   /* 
      This function partition the mesh into submeshes.
 
@@ -70,6 +75,8 @@ extern "C" {
     MType mtype;
     MAttType att_type;
     MAttrib_ptr attrib;
+    int skip_side_set_attrs = skip_side_set_attr_copy_enabled();
+    MType side_dim;
 
     /* basic mesh information */
     nf = MESH_Num_Faces(mesh);
@@ -82,9 +89,11 @@ extern "C" {
     }
 
     if (nr) {
+      side_dim = MFACE;
       ok = MESH_Vol_Partition(mesh,num,part,submeshes);
     }
     else if (nf) {
+      side_dim = MEDGE;
       ok = MESH_Surf_Partition(mesh,num,part,submeshes);
     }
     else {
@@ -105,6 +114,8 @@ extern "C" {
       att_type = MAttrib_Get_Type(attrib);
       ncomp = MAttrib_Get_NumComps(attrib);
       mtype = MAttrib_Get_EntDim(attrib);
+      if (skip_side_set_attrs && att_type == INT && mtype == side_dim)
+        continue;
       for (i = 0; i < num; i++) {
 	if (ncomp == 1)
 	  attrib =  MAttrib_New(submeshes[i], attname, att_type, mtype);
@@ -554,4 +565,3 @@ extern "C" {
 #ifdef __cplusplus
 }
 #endif
-

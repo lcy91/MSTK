@@ -17,6 +17,11 @@ https://github.com/MeshToolkit/MSTK/blob/master/LICENSE
 extern "C" {
 #endif
 
+  static int sparse_set_copy_enabled(void) {
+    const char *val = getenv("MSTK_SPARSE_SET_COPY");
+    return (val && val[0] != '\0' && val[0] != '0');
+  }
+
  /* 
     this function copy set information from mesh to submesh
     mset_global - Set in the global_mesh
@@ -35,6 +40,7 @@ extern "C" {
   List_ptr lmentlist;
   MSet_ptr *lmset_array;
   Mesh_ptr submesh;
+  int sparse_copy = sparse_set_copy_enabled();
 
   lmset_array = (MSet_ptr *) calloc(num,sizeof(MSet_ptr));
 
@@ -43,10 +49,12 @@ extern "C" {
   MSet_Name(gmset,msetname);
   mtype = MSet_EntDim(gmset);
 
-  for (i = 0; i < num; ++i) {
-    lmset_array[i] = MESH_MSetByName(submeshes[i],msetname);
-    if (!lmset_array[i])
-       lmset_array[i] = MSet_New(submeshes[i],msetname,mtype);
+  if (!sparse_copy) {
+    for (i = 0; i < num; ++i) {
+      lmset_array[i] = MESH_MSetByName(submeshes[i],msetname);
+      if (!lmset_array[i])
+        lmset_array[i] = MSet_New(submeshes[i],msetname,mtype);
+    }
   }
  
   
@@ -62,6 +70,12 @@ extern "C" {
       for (i = 0; i < num; ++i) {
 	if (submesh == submeshes[i]) {
 	  lmset = lmset_array[i];
+          if (!lmset) {
+            lmset = MESH_MSetByName(submeshes[i],msetname);
+            if (!lmset)
+              lmset = MSet_New(submeshes[i],msetname,mtype);
+            lmset_array[i] = lmset;
+          }
 	  MSet_Add(lmset,lment);
 	  break;
 	}
@@ -77,4 +91,3 @@ extern "C" {
 #ifdef __cplusplus
 }
 #endif
-

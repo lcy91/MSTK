@@ -18,6 +18,10 @@ https://github.com/MeshToolkit/MSTK/blob/master/LICENSE
 extern "C" {
 #endif
 
+  static int sendmesh_batched_set_copy(void) {
+    const char *val = getenv("MSTK_BATCHED_SET_COPY");
+    return (val && val[0] != '\0' && val[0] != '0');
+  }
 
 
   /* 
@@ -192,15 +196,8 @@ extern "C" {
       /* Send Mesh Sets */
       
       int nset = MESH_Num_MSets(mesh);
-      for (m = 0; m < nset; m++) {
-        
-        mset = MESH_MSet(mesh,m);
-        
-        MESH_Send_MSet(mesh, mset, torank, comm,
-                       numreq, maxreq, requests,
-                       numptrs2free, maxptrs2free, ptrs2free);
-        
-        if (*numreq > maxpendreq) {
+      if (sendmesh_batched_set_copy()) {
+        if (*numreq) {
           if (MPI_Waitall(*numreq,*requests,MPI_STATUSES_IGNORE) != MPI_SUCCESS)
             MSTK_Report("MSTK_Mesh_Distribute","Could not send mesh",MSTK_FATAL);
           else {
@@ -208,7 +205,29 @@ extern "C" {
             for (p = 0; p < *numptrs2free; ++p) free((*ptrs2free)[p]);
             *numptrs2free = 0;
           }
-        }	
+        }
+
+        MESH_Send_MSets_Batched(mesh, torank, comm);
+      }
+      else {
+        for (m = 0; m < nset; m++) {
+
+          mset = MESH_MSet(mesh,m);
+
+          MESH_Send_MSet(mesh, mset, torank, comm,
+                         numreq, maxreq, requests,
+                         numptrs2free, maxptrs2free, ptrs2free);
+
+          if (*numreq > maxpendreq) {
+            if (MPI_Waitall(*numreq,*requests,MPI_STATUSES_IGNORE) != MPI_SUCCESS)
+              MSTK_Report("MSTK_Mesh_Distribute","Could not send mesh",MSTK_FATAL);
+            else {
+              *numreq = 0;
+              for (p = 0; p < *numptrs2free; ++p) free((*ptrs2free)[p]);
+              *numptrs2free = 0;
+            }
+          }
+        }
       }
       
       if (*numreq) {
@@ -231,4 +250,3 @@ extern "C" {
 #ifdef __cplusplus
 }
 #endif
-

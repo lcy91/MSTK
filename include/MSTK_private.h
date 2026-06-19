@@ -408,6 +408,8 @@ typedef enum MDelType {MDELREGION=-40, MDELFACE=-30, MDELEDGE=-20, MDELVERTEX=-1
                             MSTK_Comm comm, int *numreq, int *maxreq, 
                             MPI_Request **requests, int *numptrs2free, 
                             int *maxptrs2free, void ***ptrs2free);
+  int        MESH_Send_MSets_Batched(Mesh_ptr mesh, int torank,
+                                     MSTK_Comm comm);
   int        MESH_RecvMesh(Mesh_ptr mesh, int fromrank, int with_attr,
                            MSTK_Comm comm);
   int        MESH_Recv_MetaData(Mesh_ptr mesh, int fromrank, RepType *rtype,
@@ -429,6 +431,8 @@ typedef enum MDelType {MDELREGION=-40, MDELFACE=-30, MDELEDGE=-20, MDELVERTEX=-1
                                     MSTK_Comm comm);
   int        MESH_Recv_MSet(Mesh_ptr mesh, MSet_ptr mset, int fromrank, 
                             MSTK_Comm comm);
+  int        MESH_Recv_MSets_Batched(Mesh_ptr mesh, int fromrank,
+                                     MSTK_Comm comm);
 
 
 

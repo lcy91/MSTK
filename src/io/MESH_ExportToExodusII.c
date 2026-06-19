@@ -11,6 +11,7 @@ https://github.com/MeshToolkit/MSTK/blob/master/LICENSE
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include <sys/time.h>
 
 #include "MSTK.h"
 #include "exodusII.h"
@@ -19,6 +20,64 @@ https://github.com/MeshToolkit/MSTK/blob/master/LICENSE
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+  static int exo_export_timing_enabled(void) {
+    const char *val = getenv("MSTK_MESHCONVERT_TIMING");
+    return (val && val[0] != '\0' && val[0] != '0');
+  }
+
+  static double exo_export_wtime(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return ((double) tv.tv_sec) + 1.0e-6*((double) tv.tv_usec);
+  }
+
+  static void exo_export_print_time(const char *label, double t0, double t1,
+                                    int rank, MSTK_Comm comm) {
+    double dt = t1 - t0;
+#ifdef MSTK_HAVE_MPI
+    if (comm) {
+      double dt_min = 0.0, dt_sum = 0.0, dt_max = 0.0;
+      int nproc = 1;
+      MPI_Comm_size(comm, &nproc);
+      MPI_Reduce(&dt, &dt_min, 1, MPI_DOUBLE, MPI_MIN, 0, comm);
+      MPI_Reduce(&dt, &dt_sum, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
+      MPI_Reduce(&dt, &dt_max, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+      if (rank == 0)
+        fprintf(stderr,
+                "[meshconvert][timing] %-36s min %10.3f s mean %10.3f s max %10.3f s\n",
+                label, dt_min, dt_sum/nproc, dt_max);
+      return;
+    }
+#endif
+    if (rank == 0)
+      fprintf(stderr, "[meshconvert][timing] %-36s %10.3f s\n", label, dt);
+  }
+
+  static void exo_export_sideset_name(MSet_ptr mset, char *out,
+                                      size_t outlen) {
+    char msetname[256];
+    char *suffix;
+
+    out[0] = '\0';
+    MSet_Name(mset,msetname);
+    if (strncmp(msetname,"TEMPORARY_",10) == 0) return;
+
+    suffix = strstr(msetname,"__");
+    if (strncmp(msetname,"sideset_",8) == 0 && suffix && suffix[2] != '\0')
+      strncpy(out,suffix+2,outlen);
+    else
+      strncpy(out,msetname,outlen);
+    out[outlen-1] = '\0';
+  }
+
+  static void exo_export_copy_name(char *dst, const char *src,
+                                   size_t dstlen) {
+    if (!dst || !dstlen) return;
+    if (!src) src = "";
+    strncpy(dst,src,dstlen);
+    dst[dstlen-1] = '\0';
+  }
 
   /* this function collects element block inforamtion based on element type */
   void MESH_Get_Element_Block_Info(Mesh_ptr mesh, 
@@ -35,6 +94,7 @@ extern "C" {
                               int *num_side_set_glob, 
 			      MSet_ptr **side_sets_glob, 
                               int **side_set_ids_glob,
+                              char ***side_set_names_glob,
                               MSTK_Comm comm);
   void MESH_Get_Node_Set_Info(Mesh_ptr mesh, 
                               int enable_geometry_sets,
@@ -112,7 +172,8 @@ extern "C" {
     int num_face_block;
     char **element_block_types_glob, block_name[256];
     char **element_att_names_glob, **node_att_names_glob, 
-      **sideset_att_names_glob, **elementset_att_names_glob;
+      **sideset_att_names_glob, **elementset_att_names_glob,
+      **side_set_names_glob;
     MSet_ptr *element_blocks_glob, *side_sets_glob, *node_sets_glob, 
       *element_sets_glob;
     List_ptr face_block;
@@ -130,6 +191,7 @@ extern "C" {
 			        {4,5,1,2,3,0}, /* PRISM, must verify nums */
 			        {5,6,1,2,3,4}};/* HEX */
     int rank, numprocs;
+    int timing = exo_export_timing_enabled();
 
 
     int meshdim;
@@ -458,6 +520,7 @@ extern "C" {
                   MSTK_ERROR);
       return 0;
     }
+    ex_set_max_name_length(exoid,255);
 
 
     
@@ -603,9 +666,15 @@ extern "C" {
 
     /* COLLECT SIDE SET INFO */
 
+    double collect_sideset_t0 = exo_export_wtime();
     MESH_Get_Side_Set_Info(mesh, enable_geometry_sets,
                            &num_side_set_glob, &side_sets_glob, 
-                           &side_set_ids_glob, comm);
+                           &side_set_ids_glob, &side_set_names_glob, comm);
+    double collect_sideset_t1 = exo_export_wtime();
+    if (timing)
+      exo_export_print_time("export collect side-set info",
+                            collect_sideset_t0, collect_sideset_t1,
+                            rank, comm);
 
 
 
@@ -1047,12 +1116,68 @@ extern "C" {
     
     /* Write out the side set information */
 
+    double write_sideset_t0 = exo_export_wtime();
+    long long local_export_sideset_entries = 0;
+#ifndef EXODUS_6_DEPRECATED
+    ex_set_specs side_set_specs;
+    int *concat_side_set_ids = NULL;
+    int *concat_side_set_counts = NULL;
+    int *concat_side_set_df_counts = NULL;
+    int *concat_side_set_entry_index = NULL;
+    int *concat_side_set_df_index = NULL;
+    int *concat_side_set_elem_list = NULL;
+    int *concat_side_set_side_list = NULL;
+    char **side_set_output_names = NULL;
+    int concat_side_set_max_entries = 0;
+    int concat_side_set_entries = 0;
+
+    if (num_side_set_glob) {
+      for (i = 0; i < num_side_set_glob; i++)
+        concat_side_set_max_entries += MSet_Num_Entries(side_sets_glob[i]);
+
+      concat_side_set_ids =
+        (int *) calloc(num_side_set_glob,sizeof(int));
+      concat_side_set_counts =
+        (int *) calloc(num_side_set_glob,sizeof(int));
+      concat_side_set_df_counts =
+        (int *) calloc(num_side_set_glob,sizeof(int));
+      concat_side_set_entry_index =
+        (int *) calloc(num_side_set_glob,sizeof(int));
+      concat_side_set_df_index =
+        (int *) calloc(num_side_set_glob,sizeof(int));
+      concat_side_set_elem_list = concat_side_set_max_entries ?
+        (int *) malloc(concat_side_set_max_entries*sizeof(int)) : NULL;
+      concat_side_set_side_list = concat_side_set_max_entries ?
+        (int *) malloc(concat_side_set_max_entries*sizeof(int)) : NULL;
+      side_set_output_names = (char **) calloc(num_side_set_glob,
+                                               sizeof(char *));
+      if (!concat_side_set_ids || !concat_side_set_counts ||
+          !concat_side_set_df_counts || !concat_side_set_entry_index ||
+          !concat_side_set_df_index || !side_set_output_names ||
+          (concat_side_set_max_entries &&
+           (!concat_side_set_elem_list || !concat_side_set_side_list)))
+        MSTK_Report("MESH_ExportToExodusII",
+                    "Could not allocate batched side set export buffers",
+                    MSTK_FATAL);
+
+      memset(&side_set_specs,0,sizeof(ex_set_specs));
+    }
+#endif
 
     for (i = 0; i < num_side_set_glob; i++) {
 
       int maxsides = MSet_Num_Entries(side_sets_glob[i]);
+#ifdef EXODUS_6_DEPRECATED
       int *elem_list = (int *) malloc(maxsides*sizeof(int));
       int *side_list = (int *) malloc(maxsides*sizeof(int));
+#else
+      int set_start = concat_side_set_entries;
+      int *elem_list = concat_side_set_elem_list ?
+        &(concat_side_set_elem_list[set_start]) : NULL;
+      int *side_list = concat_side_set_side_list ?
+        &(concat_side_set_side_list[set_start]) : NULL;
+#endif
+      char sideset_output_name[256];
 
       int nsides = 0;
       if (nrowned) {        
@@ -1152,13 +1277,96 @@ extern "C" {
       ex_put_side_set_param(exoid, side_set_ids_glob[i], nsides, 0);
       ex_put_side_set(exoid, side_set_ids_glob[i], elem_list, side_list);
 #else
-      ex_put_set_param(exoid, EX_SIDE_SET, side_set_ids_glob[i], nsides, 0);
-      ex_put_set(exoid, EX_SIDE_SET, side_set_ids_glob[i], elem_list,
-                   side_list);
-#endif
+      concat_side_set_ids[i] = side_set_ids_glob[i];
+      concat_side_set_counts[i] = nsides;
+      concat_side_set_df_counts[i] = 0;
+      concat_side_set_entry_index[i] = set_start;
+      concat_side_set_df_index[i] = 0;
+      concat_side_set_entries += nsides;
 
+      side_set_output_names[i] = (char *) calloc(256,sizeof(char));
+      if (!side_set_output_names[i])
+        MSTK_Report("MESH_ExportToExodusII",
+                    "Could not allocate side set name buffer", MSTK_FATAL);
+      if (side_set_names_glob && side_set_names_glob[i])
+        exo_export_copy_name(side_set_output_names[i], side_set_names_glob[i],
+                             256);
+      else
+        exo_export_sideset_name(side_sets_glob[i], sideset_output_name,
+                                sizeof(sideset_output_name));
+      if ((!side_set_names_glob || !side_set_names_glob[i]) &&
+          sideset_output_name[0] != '\0')
+        exo_export_copy_name(side_set_output_names[i], sideset_output_name,
+                             256);
+#endif
+      local_export_sideset_entries += nsides;
+
+#ifdef EXODUS_6_DEPRECATED
       free(elem_list);
       free(side_list);
+#endif
+    }
+#ifndef EXODUS_6_DEPRECATED
+    if (num_side_set_glob) {
+      side_set_specs.sets_ids = concat_side_set_ids;
+      side_set_specs.num_entries_per_set = concat_side_set_counts;
+      side_set_specs.num_dist_per_set = concat_side_set_df_counts;
+      side_set_specs.sets_entry_index = concat_side_set_entry_index;
+      side_set_specs.sets_dist_index = concat_side_set_df_index;
+      side_set_specs.sets_entry_list = concat_side_set_elem_list;
+      side_set_specs.sets_extra_list = concat_side_set_side_list;
+      side_set_specs.sets_dist_fact = NULL;
+
+      status = ex_put_concat_sets(exoid, EX_SIDE_SET, &side_set_specs);
+      if (status < 0)
+        MSTK_Report("MESH_ExportToExodusII",
+                    "Could not write Exodus II side sets", MSTK_ERROR);
+
+      status = ex_put_names(exoid, EX_SIDE_SET, side_set_output_names);
+      if (status < 0)
+        MSTK_Report("MESH_ExportToExodusII",
+                    "Could not write Exodus II side set names", MSTK_ERROR);
+
+      for (i = 0; i < num_side_set_glob; i++) {
+        free(side_set_output_names[i]);
+      }
+      free(concat_side_set_ids);
+      free(concat_side_set_counts);
+      free(concat_side_set_df_counts);
+      free(concat_side_set_entry_index);
+      free(concat_side_set_df_index);
+      free(concat_side_set_elem_list);
+      free(concat_side_set_side_list);
+      free(side_set_output_names);
+    }
+#endif
+    double write_sideset_t1 = exo_export_wtime();
+    if (timing) {
+      exo_export_print_time("export write side sets",
+                            write_sideset_t0, write_sideset_t1,
+                            rank, comm);
+#ifdef MSTK_HAVE_MPI
+      if (comm) {
+        long long min_entries = 0, sum_entries = 0, max_entries = 0;
+        MPI_Reduce(&local_export_sideset_entries, &min_entries, 1,
+                   MPI_LONG_LONG, MPI_MIN, 0, comm);
+        MPI_Reduce(&local_export_sideset_entries, &sum_entries, 1,
+                   MPI_LONG_LONG, MPI_SUM, 0, comm);
+        MPI_Reduce(&local_export_sideset_entries, &max_entries, 1,
+                   MPI_LONG_LONG, MPI_MAX, 0, comm);
+        if (rank == 0)
+          fprintf(stderr,
+                  "[meshconvert][timing] export side-set entries sets=%d local min=%lld mean=%.1f max=%lld global-sum=%lld\n",
+                  num_side_set_glob, min_entries,
+                  numprocs ? ((double) sum_entries)/numprocs : 0.0,
+                  max_entries, sum_entries);
+      }
+      else
+#endif
+      if (rank == 0)
+        fprintf(stderr,
+                "[meshconvert][timing] export side-set entries sets=%d entries=%lld\n",
+                num_side_set_glob, local_export_sideset_entries);
     }
 
     if (verbose)
@@ -1166,21 +1374,131 @@ extern "C" {
 
 
     /* Write out element set information */
-  
+
+    double write_elementset_t0 = exo_export_wtime();
+    long long local_export_elementset_entries = 0;
+#ifndef EXODUS_6_DEPRECATED
+    ex_set_specs element_set_specs;
+    int *concat_element_set_ids = NULL;
+    int *concat_element_set_counts = NULL;
+    int *concat_element_set_df_counts = NULL;
+    int *concat_element_set_entry_index = NULL;
+    int *concat_element_set_df_index = NULL;
+    int *concat_element_set_list = NULL;
+    int concat_element_set_max_entries = 0;
+    int concat_element_set_entries = 0;
+
+    if (num_element_set_glob) {
+      for (i = 0; i < num_element_set_glob; i++)
+        concat_element_set_max_entries +=
+          MSet_Num_Entries(element_sets_glob[i]);
+
+      concat_element_set_ids =
+        (int *) calloc(num_element_set_glob,sizeof(int));
+      concat_element_set_counts =
+        (int *) calloc(num_element_set_glob,sizeof(int));
+      concat_element_set_df_counts =
+        (int *) calloc(num_element_set_glob,sizeof(int));
+      concat_element_set_entry_index =
+        (int *) calloc(num_element_set_glob,sizeof(int));
+      concat_element_set_df_index =
+        (int *) calloc(num_element_set_glob,sizeof(int));
+      concat_element_set_list = concat_element_set_max_entries ?
+        (int *) malloc(concat_element_set_max_entries*sizeof(int)) : NULL;
+      if (!concat_element_set_ids || !concat_element_set_counts ||
+          !concat_element_set_df_counts || !concat_element_set_entry_index ||
+          !concat_element_set_df_index ||
+          (concat_element_set_max_entries && !concat_element_set_list))
+        MSTK_Report("MESH_ExportToExodusII",
+                    "Could not allocate batched element set export buffers",
+                    MSTK_FATAL);
+
+      memset(&element_set_specs,0,sizeof(ex_set_specs));
+    }
+#endif
+
     for (i = 0; i < num_element_set_glob; i++) {
       int nelements = MSet_Num_Entries(element_sets_glob[i]);
+#ifdef EXODUS_6_DEPRECATED
       ex_put_set_param(exoid, EX_ELEM_SET, element_set_ids_glob[i], nelements, 0);
 
       int *element_list = (int *) malloc(nelements*sizeof(int));
+#else
+      int set_start = concat_element_set_entries;
+      int *element_list = concat_element_set_list ?
+        &(concat_element_set_list[set_start]) : NULL;
+#endif
 
       MEntity_ptr ment;
       idx = 0; j = 0;
       while ((ment = MSet_Next_Entry(element_sets_glob[i],&idx)))
         element_list[j++] = elem_id[MEnt_ID(ment)-1];
 
+#ifdef EXODUS_6_DEPRECATED
       ex_put_set(exoid, EX_ELEM_SET, element_set_ids_glob[i], element_list, NULL);
 
       free(element_list);
+#else
+      concat_element_set_ids[i] = element_set_ids_glob[i];
+      concat_element_set_counts[i] = nelements;
+      concat_element_set_df_counts[i] = 0;
+      concat_element_set_entry_index[i] = set_start;
+      concat_element_set_df_index[i] = 0;
+      concat_element_set_entries += nelements;
+#endif
+      local_export_elementset_entries += nelements;
+    }
+#ifndef EXODUS_6_DEPRECATED
+    if (num_element_set_glob) {
+      element_set_specs.sets_ids = concat_element_set_ids;
+      element_set_specs.num_entries_per_set = concat_element_set_counts;
+      element_set_specs.num_dist_per_set = concat_element_set_df_counts;
+      element_set_specs.sets_entry_index = concat_element_set_entry_index;
+      element_set_specs.sets_dist_index = concat_element_set_df_index;
+      element_set_specs.sets_entry_list = concat_element_set_list;
+      element_set_specs.sets_extra_list = NULL;
+      element_set_specs.sets_dist_fact = NULL;
+
+      status = ex_put_concat_sets(exoid, EX_ELEM_SET, &element_set_specs);
+      if (status < 0)
+        MSTK_Report("MESH_ExportToExodusII",
+                    "Could not write Exodus II element sets", MSTK_ERROR);
+
+      free(concat_element_set_ids);
+      free(concat_element_set_counts);
+      free(concat_element_set_df_counts);
+      free(concat_element_set_entry_index);
+      free(concat_element_set_df_index);
+      free(concat_element_set_list);
+    }
+#endif
+    double write_elementset_t1 = exo_export_wtime();
+    if (timing) {
+      exo_export_print_time("export write element sets",
+                            write_elementset_t0, write_elementset_t1,
+                            rank, comm);
+#ifdef MSTK_HAVE_MPI
+      if (comm) {
+        long long min_entries = 0, sum_entries = 0, max_entries = 0;
+        MPI_Reduce(&local_export_elementset_entries, &min_entries, 1,
+                   MPI_LONG_LONG, MPI_MIN, 0, comm);
+        MPI_Reduce(&local_export_elementset_entries, &sum_entries, 1,
+                   MPI_LONG_LONG, MPI_SUM, 0, comm);
+        MPI_Reduce(&local_export_elementset_entries, &max_entries, 1,
+                   MPI_LONG_LONG, MPI_MAX, 0, comm);
+        if (rank == 0)
+          fprintf(stderr,
+                  "[meshconvert][timing] export element-set entries sets=%d local min=%lld mean=%.1f max=%lld global-sum=%lld\n",
+                  num_element_set_glob, min_entries,
+                  numprocs ? ((double) sum_entries)/numprocs : 0.0,
+                  max_entries, sum_entries);
+      }
+      else
+#endif
+      if (rank == 0)
+        fprintf(stderr,
+                "[meshconvert][timing] export element-set entries sets=%d entries=%lld\n",
+                num_element_set_glob, local_export_elementset_entries);
     }
     
     if (verbose)
@@ -1628,6 +1946,11 @@ extern "C" {
     
     if (num_side_set_glob) {
       free(side_set_ids_glob);
+      if (side_set_names_glob) {
+        for (i = 0; i < num_side_set_glob; i++)
+          free(side_set_names_glob[i]);
+        free(side_set_names_glob);
+      }
       for (i = 0; i < num_side_set_glob; i++) {
         MSet_Name(side_sets_glob[i],msetname);
         if (strncmp(msetname,"TEMPORARY_",10) == 0)
@@ -2132,6 +2455,7 @@ extern "C" {
                               int *num_side_set_glob, 
 			      MSet_ptr **side_sets_glob, 
                               int **side_set_ids_glob,
+                              char ***side_set_names_glob,
                               MSTK_Comm comm) {
     MSet_ptr mset;
     MFace_ptr mf;
@@ -2156,6 +2480,8 @@ extern "C" {
     nsalloc = 10;
     MSet_ptr *side_sets = (MSet_ptr *) malloc(nsalloc*sizeof(MSet_ptr));
     int *side_set_ids = (int *) malloc(nsalloc*sizeof(int));
+    char (*side_set_names)[256] =
+      (char (*)[256]) calloc(nsalloc,sizeof(char [256]));
 
     nr = MESH_Num_Regions(mesh);
     nf = MESH_Num_Faces(mesh);
@@ -2182,10 +2508,15 @@ extern "C" {
           nsalloc *= 2;
           side_sets = (MSet_ptr *) realloc(side_sets,nsalloc*sizeof(MSet_ptr));
           side_set_ids = (int *) realloc(side_set_ids,nsalloc*sizeof(int));
+          side_set_names =
+            (char (*)[256]) realloc(side_set_names,
+                                    nsalloc*sizeof(char [256]));
         }
 
         side_set_ids[nsideset] = sid;
         side_sets[nsideset] = mset;
+        exo_export_sideset_name(mset,side_set_names[nsideset],
+                                sizeof(side_set_names[nsideset]));
         nsideset++;
       }
     
@@ -2225,6 +2556,9 @@ extern "C" {
               nsalloc *= 2;
               side_sets = (MSet_ptr *) realloc(side_sets,nsalloc*sizeof(MSet_ptr));
               side_set_ids = (int *) realloc(side_set_ids,nsalloc*sizeof(int));
+              side_set_names =
+                (char (*)[256]) realloc(side_set_names,
+                                        nsalloc*sizeof(char [256]));
             }
             
             /* create a sideset whose name starts with the string
@@ -2236,6 +2570,7 @@ extern "C" {
             side_sets[nsideset] = MSet_New(mesh,sidesetname,MFACE);
             MSet_Add(side_sets[nsideset],mf);
             side_set_ids[nsideset] = sid;
+            side_set_names[nsideset][0] = '\0';
             nsideset++;
           }
         }
@@ -2266,10 +2601,15 @@ extern "C" {
           nsalloc *= 2;
           side_sets = (MSet_ptr *) realloc(side_sets,nsalloc*sizeof(MSet_ptr));
           side_set_ids = (int *) realloc(side_set_ids,nsalloc*sizeof(int));
+          side_set_names =
+            (char (*)[256]) realloc(side_set_names,
+                                    nsalloc*sizeof(char [256]));
         }
 
         side_set_ids[nsideset] = sid;
         side_sets[nsideset] = mset;
+        exo_export_sideset_name(mset,side_set_names[nsideset],
+                                sizeof(side_set_names[nsideset]));
         nsideset++;
       }
 
@@ -2310,6 +2650,9 @@ extern "C" {
               nsalloc *= 2;
               side_sets = (MSet_ptr *) realloc(side_sets,nsalloc*sizeof(MSet_ptr));
               side_set_ids = (int *) realloc(side_set_ids,nsalloc*sizeof(int));
+              side_set_names =
+                (char (*)[256]) realloc(side_set_names,
+                                        nsalloc*sizeof(char [256]));
             }
 
             /* create a sideset whose name starts with the string
@@ -2321,6 +2664,7 @@ extern "C" {
             side_sets[nsideset] = MSet_New(mesh,sidesetname,MEDGE);
             MSet_Add(side_sets[nsideset],me);
             side_set_ids[nsideset] = sid;
+            side_set_names[nsideset][0] = '\0';
             nsideset++;
           }
         }
@@ -2338,14 +2682,21 @@ extern "C" {
       MPI_Allreduce(&nsideset,&maxnum,1,MPI_INT,MPI_MAX,comm);
       
       int *ssids_array_loc = (int *) calloc(maxnum,sizeof(int));
+      char *ssnames_array_loc = (char *) calloc(maxnum*256,sizeof(char));
       
-      for (i = 0; i < nsideset; i++)
+      for (i = 0; i < nsideset; i++) {
         ssids_array_loc[i] = side_set_ids[i];
+        strncpy(&(ssnames_array_loc[i*256]),side_set_names[i],256);
+      }
       
       int *ssids_array_glob = (int *) calloc(maxnum*numprocs,sizeof(int));
+      char *ssnames_array_glob =
+        (char *) calloc(maxnum*numprocs*256,sizeof(char));
       
       MPI_Gather(ssids_array_loc,maxnum,MPI_INT,ssids_array_glob,maxnum,
                  MPI_INT,0,comm);
+      MPI_Gather(ssnames_array_loc,maxnum*256,MPI_CHAR,ssnames_array_glob,
+                 maxnum*256,MPI_CHAR,0,comm);
       
       if (rank == 0) {
         
@@ -2377,6 +2728,8 @@ extern "C" {
                  the global list. Put it in. */
               
               ssids_array_glob[maxnum1] = ssids_array_glob[offset+j];
+              strncpy(&(ssnames_array_glob[maxnum1*256]),
+                      &(ssnames_array_glob[(offset+j)*256]),256);
               maxnum1++;
               
             }
@@ -2394,11 +2747,20 @@ extern "C" {
       /* Send everyone the IDs of these sidesets */
       
       *side_set_ids_glob = (int *) malloc((*num_side_set_glob)*sizeof(int));
+      *side_set_names_glob =
+        (char **) malloc((*num_side_set_glob)*sizeof(char *));
+      for (i = 0; i < (*num_side_set_glob); i++)
+        (*side_set_names_glob)[i] = (char *) calloc(256,sizeof(char));
       if (rank == 0)
-        for (i = 0; i < (*num_side_set_glob); i++)
+        for (i = 0; i < (*num_side_set_glob); i++) {
           (*side_set_ids_glob)[i] = ssids_array_glob[i];
+          strncpy((*side_set_names_glob)[i],
+                  &(ssnames_array_glob[i*256]),256);
+        }
       
       MPI_Bcast(*side_set_ids_glob,*num_side_set_glob,MPI_INT,0,comm);
+      for (i = 0; i < (*num_side_set_glob); i++)
+        MPI_Bcast((*side_set_names_glob)[i],256,MPI_CHAR,0,comm);
       
       /* Populate the global sideset data on each processor */
       
@@ -2433,6 +2795,8 @@ extern "C" {
       
       free(ssids_array_loc);
       free(ssids_array_glob);
+      free(ssnames_array_loc);
+      free(ssnames_array_glob);
 
     }
     else { /* No communicator given - treat it as a serial run */
@@ -2440,6 +2804,11 @@ extern "C" {
       *num_side_set_glob = nsideset;
       *side_set_ids_glob = (int *) malloc(nsideset*sizeof(int));
       memcpy(*side_set_ids_glob,side_set_ids,nsideset*sizeof(int));
+      *side_set_names_glob = (char **) malloc(nsideset*sizeof(char *));
+      for (i = 0; i < nsideset; i++) {
+        (*side_set_names_glob)[i] = (char *) calloc(256,sizeof(char));
+        strncpy((*side_set_names_glob)[i],side_set_names[i],256);
+      }
 
       *side_sets_glob = (MSet_ptr *) malloc(nsideset*sizeof(MSet_ptr));
       memcpy(*side_sets_glob,side_sets,nsideset*sizeof(MSet_ptr));
@@ -2452,12 +2821,20 @@ extern "C" {
 
     *side_set_ids_glob = (int *) malloc(nsideset*sizeof(int));
     memcpy(*side_set_ids_glob,side_set_ids,nsideset*sizeof(int));
+    *side_set_names_glob = (char **) malloc(nsideset*sizeof(char *));
+    for (i = 0; i < nsideset; i++) {
+      (*side_set_names_glob)[i] = (char *) calloc(256,sizeof(char));
+      strncpy((*side_set_names_glob)[i],side_set_names[i],256);
+    }
 
     *side_sets_glob = (MSet_ptr *) malloc(nsideset*sizeof(MSet_ptr));
     memcpy(*side_sets_glob,side_sets,nsideset*sizeof(MSet_ptr));
 
 #endif
 
+    free(side_sets);
+    free(side_set_ids);
+    free(side_set_names);
 
   }
   
@@ -3243,4 +3620,3 @@ extern "C" {
 #ifdef __cplusplus
 }
 #endif
-

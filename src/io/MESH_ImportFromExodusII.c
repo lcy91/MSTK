@@ -9,6 +9,7 @@ https://github.com/MeshToolkit/MSTK/blob/master/LICENSE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 
 #include "MSTK.h"
 #include "MSTK_private.h"
@@ -25,6 +26,40 @@ https://github.com/MeshToolkit/MSTK/blob/master/LICENSE
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+  static int mstk_meshconvert_timing_enabled(void) {
+    const char *val = getenv("MSTK_MESHCONVERT_TIMING");
+    return (val && val[0] != '\0' && val[0] != '0');
+  }
+
+  static double mstk_meshconvert_wtime(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return ((double) tv.tv_sec) + 1.0e-6*((double) tv.tv_usec);
+  }
+
+  static void mstk_meshconvert_print_time(const char *label, double t0,
+                                          double t1, int rank,
+                                          MSTK_Comm comm) {
+    double dt = t1 - t0;
+#ifdef MSTK_HAVE_MPI
+    if (comm) {
+      double dt_min = 0.0, dt_sum = 0.0, dt_max = 0.0;
+      int nproc = 1;
+      MPI_Comm_size(comm, &nproc);
+      MPI_Reduce(&dt, &dt_min, 1, MPI_DOUBLE, MPI_MIN, 0, comm);
+      MPI_Reduce(&dt, &dt_sum, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
+      MPI_Reduce(&dt, &dt_max, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+      if (rank == 0)
+        fprintf(stderr,
+                "[meshconvert][timing] %-36s min %10.3f s mean %10.3f s max %10.3f s\n",
+                label, dt_min, dt_sum/nproc, dt_max);
+      return;
+    }
+#endif
+    if (rank == 0)
+      fprintf(stderr, "[meshconvert][timing] %-36s %10.3f s\n", label, dt);
+  }
 
 
   /* Read an Exodus II file into MSTK */
@@ -63,6 +98,7 @@ extern "C" {
 
   char mesg[256], funcname[32]="MESH_ImportFromExodusII";
   int distributed=0;
+  int timing = mstk_meshconvert_timing_enabled();
   
   ex_init_params exopar;
 
@@ -124,7 +160,14 @@ extern "C" {
         if (rank == 0) { /* Read only on processor 0 */
           
           globalmesh = MESH_New(MESH_RepType(mesh));
+          double serial_read_t0 = mstk_meshconvert_wtime();
           int read_status = MESH_ReadExodusII_Serial(globalmesh,filename,rank);
+          double serial_read_t1 = mstk_meshconvert_wtime();
+          if (timing)
+            fprintf(stderr,
+                    "[meshconvert][timing] %-36s %10.3f s\n",
+                    "rank0 MESH_ReadExodusII_Serial",
+                    serial_read_t1 - serial_read_t0);
           
           if (!read_status) {
             sprintf(mesg,"Could not read Exodus II file %s successfully\n",
@@ -139,10 +182,16 @@ extern "C" {
         
         int with_attr = 1;      
         int del_inmesh = 1;
+        double distribute_t0 = mstk_meshconvert_wtime();
         int dist_status = MSTK_Mesh_Distribute(globalmesh, &mesh, &topodim, 
                                                num_ghost_layers,
                                                with_attr, part_method, 
                                                del_inmesh, comm);
+        double distribute_t1 = mstk_meshconvert_wtime();
+        if (timing)
+          mstk_meshconvert_print_time("MSTK_Mesh_Distribute",
+                                      distribute_t0, distribute_t1,
+                                      rank, comm);
         if (!dist_status)
           MSTK_Report(funcname,
                       "Could not distribute meshes to other processors",
@@ -287,14 +336,25 @@ extern "C" {
 		      MSTK_FATAL);
 	}
 
+        double partial_read_t0 = mstk_meshconvert_wtime();
 	MESH_ReadExodusII_Partial(mesh, filename, rank, num_myelems, myelems);
+        double partial_read_t1 = mstk_meshconvert_wtime();
+        if (timing)
+          mstk_meshconvert_print_time("MESH_ReadExodusII_Partial",
+                                      partial_read_t0, partial_read_t1,
+                                      rank, comm);
 
 
 	/* Weave the meshes together to establish interprocessor connectivity */
 	int num_ghost_layers = 1;
 	int input_type = 1;
+        double weave_t0 = mstk_meshconvert_wtime();
 	MSTK_Weave_DistributedMeshes(mesh, dim, num_ghost_layers, input_type,
 				     comm);
+        double weave_t1 = mstk_meshconvert_wtime();
+        if (timing)
+          mstk_meshconvert_print_time("MSTK_Weave_DistributedMeshes",
+                                      weave_t0, weave_t1, rank, comm);
 	
       }
       else if (parallel_opts[1] == 2) {
@@ -304,7 +364,12 @@ extern "C" {
         
       }
 
-      int parallel_check = MESH_Parallel_Check(mesh,comm);        
+      double pcheck_t0 = mstk_meshconvert_wtime();
+      int parallel_check = MESH_Parallel_Check(mesh,comm);
+      double pcheck_t1 = mstk_meshconvert_wtime();
+      if (timing)
+        mstk_meshconvert_print_time("MESH_Parallel_Check", pcheck_t0,
+                                    pcheck_t1, rank, comm);
       
       if (!parallel_check)
         MSTK_Report(funcname, "Parallel mesh checks failed", MSTK_FATAL);

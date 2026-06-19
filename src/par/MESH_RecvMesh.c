@@ -19,6 +19,11 @@ https://github.com/MeshToolkit/MSTK/blob/master/LICENSE
 extern "C" {
 #endif
 
+  static int recvmesh_batched_set_copy(void) {
+    const char *val = getenv("MSTK_BATCHED_SET_COPY");
+    return (val && val[0] != '\0' && val[0] != '0');
+  }
+
   /* 
      This function receives mesh from processor rank in communicator comm
 
@@ -87,10 +92,15 @@ extern "C" {
          processor put them out */
       
       int nset_local = MESH_Num_MSets(mesh);
-      
-      for (m = 0; m < nset_local; m++) {
-        mset = MESH_MSet(mesh,m);
-        MESH_Recv_MSet(mesh,mset,fromrank,comm);
+
+      if (recvmesh_batched_set_copy()) {
+        MESH_Recv_MSets_Batched(mesh,fromrank,comm);
+      }
+      else {
+        for (m = 0; m < nset_local; m++) {
+          mset = MESH_MSet(mesh,m);
+          MESH_Recv_MSet(mesh,mset,fromrank,comm);
+        }
       }
 
     } /* if (with_attr) */
@@ -102,4 +112,3 @@ extern "C" {
 #ifdef __cplusplus
 }
 #endif
-

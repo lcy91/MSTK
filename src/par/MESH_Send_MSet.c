@@ -97,11 +97,74 @@ extern "C" {
     return 1;
   }
 
+  int MESH_Send_MSets_Batched(Mesh_ptr mesh, int torank, MSTK_Comm comm) {
+    int m, idx, nset, total_entries, pair_count, result;
+    int *header, *offsets, *entry_pairs;
+    MSet_ptr mset;
+    MEntity_ptr ment;
+
+    nset = MESH_Num_MSets(mesh);
+    total_entries = 0;
+    for (m = 0; m < nset; m++) {
+      mset = MESH_MSet(mesh,m);
+      total_entries += MSet_Num_Entries(mset);
+    }
+
+    header = (int *) malloc(2*sizeof(int));
+    offsets = (int *) malloc((nset+1)*sizeof(int));
+    entry_pairs = total_entries ?
+      (int *) malloc(2*total_entries*sizeof(int)) : NULL;
+
+    if (!header || !offsets || (total_entries && !entry_pairs))
+      MSTK_Report("MESH_Send_MSets_Batched",
+                  "Could not allocate batched mesh set buffers",
+                  MSTK_FATAL);
+
+    header[0] = nset;
+    header[1] = total_entries;
+
+    pair_count = 0;
+    offsets[0] = 0;
+    for (m = 0; m < nset; m++) {
+      mset = MESH_MSet(mesh,m);
+      idx = 0;
+      while ((ment = MSet_Next_Entry(mset,&idx))) {
+        entry_pairs[2*pair_count] = MEnt_Dim(ment);
+        entry_pairs[2*pair_count+1] = MEnt_GlobalID(ment);
+        pair_count++;
+      }
+      offsets[m+1] = pair_count;
+    }
+
+    result = MPI_Send(header,2,MPI_INT,torank,torank,comm);
+    if (result != MPI_SUCCESS)
+      MSTK_Report("MESH_Send_MSets_Batched",
+                  "Error sending mesh set batch header", MSTK_FATAL);
+
+    result = MPI_Send(offsets,nset+1,MPI_INT,torank,torank,comm);
+    if (result != MPI_SUCCESS)
+      MSTK_Report("MESH_Send_MSets_Batched",
+                  "Error sending mesh set batch offsets", MSTK_FATAL);
+
+    if (total_entries) {
+      result = MPI_Send(entry_pairs,2*total_entries,MPI_INT,torank,torank,
+                        comm);
+      if (result != MPI_SUCCESS)
+        MSTK_Report("MESH_Send_MSets_Batched",
+                    "Error sending mesh set batch entries", MSTK_FATAL);
+    }
+
+    free(header);
+    free(offsets);
+    free(entry_pairs);
+
+    return 1;
+  }
+
 
   
 #ifdef __cplusplus
 }
 #endif
-
 
 

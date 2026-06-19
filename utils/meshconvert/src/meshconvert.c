@@ -12,12 +12,74 @@ https://github.com/MeshToolkit/MSTK/blob/master/LICENSE
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <sys/resource.h>
+#include <sys/time.h>
 
 #ifdef _MSTK_HAVE_MPI
 #include <mpi.h>
 #endif
 
 #include "MSTK.h"
+
+static double meshconvert_wtime(void) {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return ((double) tv.tv_sec) + 1.0e-6*((double) tv.tv_usec);
+}
+
+static double meshconvert_maxrss_mb(void) {
+  struct rusage usage;
+  if (getrusage(RUSAGE_SELF, &usage) != 0)
+    return 0.0;
+#ifdef __APPLE__
+  return ((double) usage.ru_maxrss)/(1024.0*1024.0);
+#else
+  return ((double) usage.ru_maxrss)/1024.0;
+#endif
+}
+
+static void meshconvert_print_time(const char *label, double t0, double t1,
+                                   int rank, MSTK_Comm comm) {
+  double dt = t1 - t0;
+#ifdef MSTK_HAVE_MPI
+  if (comm) {
+    double dt_min = 0.0, dt_sum = 0.0, dt_max = 0.0;
+    MPI_Reduce(&dt, &dt_min, 1, MPI_DOUBLE, MPI_MIN, 0, comm);
+    MPI_Reduce(&dt, &dt_sum, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
+    MPI_Reduce(&dt, &dt_max, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+    int nproc = 1;
+    MPI_Comm_size(comm, &nproc);
+    if (rank == 0)
+      fprintf(stderr,
+              "[meshconvert][timing] %-36s min %10.3f s mean %10.3f s max %10.3f s\n",
+              label, dt_min, dt_sum/nproc, dt_max);
+    return;
+  }
+#endif
+  if (rank == 0)
+    fprintf(stderr, "[meshconvert][timing] %-36s %10.3f s\n", label, dt);
+}
+
+static void meshconvert_print_memory(const char *label, int rank, MSTK_Comm comm) {
+  double rss = meshconvert_maxrss_mb();
+#ifdef MSTK_HAVE_MPI
+  if (comm) {
+    double rss_min = 0.0, rss_sum = 0.0, rss_max = 0.0;
+    MPI_Reduce(&rss, &rss_min, 1, MPI_DOUBLE, MPI_MIN, 0, comm);
+    MPI_Reduce(&rss, &rss_sum, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
+    MPI_Reduce(&rss, &rss_max, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+    int nproc = 1;
+    MPI_Comm_size(comm, &nproc);
+    if (rank == 0)
+      fprintf(stderr,
+              "[meshconvert][memory] %-36s min %10.1f MB mean %10.1f MB max %10.1f MB\n",
+              label, rss_min, rss_sum/nproc, rss_max);
+    return;
+  }
+#endif
+  if (rank == 0)
+    fprintf(stderr, "[meshconvert][memory] %-36s %10.1f MB\n", label, rss);
+}
 
 MshFmt getFormat(char *filename) {
   int len = strlen(filename);
@@ -55,13 +117,17 @@ int main(int argc, char *argv[]) {
   int len, ok;
   int build_classfn=1, partition=-1, weave=-1, use_geometry=0, parallel_check=0;
   int check_topo=0;
-  int num_ghost_layers=0, partmethod=0;
+  int num_ghost_layers=0, partmethod=0, timing=0;
+  int experimental_skip_side_set_attrs=0;
+  int experimental_sparse_set_copy=0;
+  int experimental_batched_set_copy=0;
+  int experimental_preserve_named_sidesets=0;
   MshFmt inmeshfmt, outmeshfmt;
   FILE *fp;
 
   if (argc < 3) {
     fprintf(stderr,"\n");
-    fprintf(stderr,"usage: meshconvert <--classify=0|n|1|y|2> <--partition=y|1|n|0> <--partition-method=0|1|2> <--parallel-check=y|1|n|0> <--weave=y|1|n|0> <--num-ghost-layers=?> <--check-topo=y|1|n|0> infilename outfilename\n\n");
+    fprintf(stderr,"usage: meshconvert <--timing> <--experimental-skip-side-set-attrs> <--experimental-sparse-set-copy> <--experimental-batched-set-copy> <--experimental-preserve-named-sidesets> <--classify=0|n|1|y|2> <--partition=y|1|n|0> <--partition-method=0|1|2> <--parallel-check=y|1|n|0> <--weave=y|1|n|0> <--num-ghost-layers=?> <--check-topo=y|1|n|0> infilename outfilename\n\n");
     fprintf(stderr,"partition-method = 0, METIS\n");
     fprintf(stderr,"                 = 1, ZOLTAN with GRAPH partioning\n");
     fprintf(stderr,"                 = 2, ZOLTAN with RCB partitioning\n");
@@ -107,10 +173,33 @@ int main(int argc, char *argv[]) {
     fprintf(stderr,"Contact: Rao Garimella (rao@lanl.gov)\n\n");
   }
 
+  double total_t0 = meshconvert_wtime();
+  double parse_t0 = meshconvert_wtime();
+
   if (argc > 3) {
     int i;
     for (i = 1; i < argc-2; i++) {
-      if (strncmp(argv[i],"--classify",10) == 0) {
+      if (strncmp(argv[i],"--timing",8) == 0) {
+        timing = 1;
+        setenv("MSTK_MESHCONVERT_TIMING", "1", 1);
+      }
+      else if (strncmp(argv[i],"--experimental-skip-side-set-attrs",34) == 0) {
+        experimental_skip_side_set_attrs = 1;
+        setenv("MSTK_SKIP_SIDE_SET_ATTR_COPY", "1", 1);
+      }
+      else if (strncmp(argv[i],"--experimental-sparse-set-copy",30) == 0) {
+        experimental_sparse_set_copy = 1;
+        setenv("MSTK_SPARSE_SET_COPY", "1", 1);
+      }
+      else if (strncmp(argv[i],"--experimental-batched-set-copy",31) == 0) {
+        experimental_batched_set_copy = 1;
+        setenv("MSTK_BATCHED_SET_COPY", "1", 1);
+      }
+      else if (strncmp(argv[i],"--experimental-preserve-named-sidesets",38) == 0) {
+        experimental_preserve_named_sidesets = 1;
+        setenv("MSTK_PRESERVE_NAMED_SIDESETS", "1", 1);
+      }
+      else if (strncmp(argv[i],"--classify",10) == 0) {
         if (strncmp(argv[i]+11,"y",1) == 0 ||
             strncmp(argv[i]+11,"1",1) == 0)
           build_classfn = 1;
@@ -180,6 +269,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr,"Unrecognized option...Ignoring\n");
     }
   }
+  double parse_t1 = meshconvert_wtime();
 
   /* what format is the input mesh file in? */
   strcpy(infname,argv[argc-2]);
@@ -191,6 +281,9 @@ int main(int argc, char *argv[]) {
   /* what format should the output mesh file be in? */
   strcpy(outfname,argv[argc-1]);
   outmeshfmt = getFormat(outfname);
+
+  if (timing)
+    meshconvert_print_time("argument parsing", parse_t0, parse_t1, rank, comm);
 
 
 
@@ -248,6 +341,24 @@ int main(int argc, char *argv[]) {
   }
 #endif
 
+  if (timing && rank == 0) {
+    fprintf(stderr,
+            "[meshconvert][timing] enabled ranks=%d partition=%d partition-method=%d classify=%d serial_file=%d parallel_file=%d weave=%d input=%s output=%s\n",
+            numprocs, partition, partmethod, build_classfn, serial_file,
+            parallel_file, weave, infname, outfname);
+    if (experimental_skip_side_set_attrs)
+      fprintf(stderr,
+              "[meshconvert][timing] experimental-skip-side-set-attrs enabled\n");
+    if (experimental_sparse_set_copy)
+      fprintf(stderr,
+              "[meshconvert][timing] experimental-sparse-set-copy enabled\n");
+    if (experimental_batched_set_copy)
+      fprintf(stderr,
+              "[meshconvert][timing] experimental-batched-set-copy enabled\n");
+    if (experimental_preserve_named_sidesets)
+      fprintf(stderr,
+              "[meshconvert][timing] experimental-preserve-named-sidesets enabled\n");
+  }
 
   /* now read the mesh */
 
@@ -267,7 +378,14 @@ int main(int argc, char *argv[]) {
       opts[3] = partmethod;
 
       mesh = MESH_New(F1);
+      double import_t0 = meshconvert_wtime();
       ok = MESH_ImportFromFile(mesh,infname,"exodusii",opts,comm);
+      double import_t1 = meshconvert_wtime();
+      if (timing) {
+        meshconvert_print_time("MESH_ImportFromFile", import_t0, import_t1,
+                               rank, comm);
+        meshconvert_print_memory("after MESH_ImportFromFile", rank, comm);
+      }
 
     } else {
 
@@ -280,20 +398,35 @@ int main(int argc, char *argv[]) {
 	case MSTK: {
 	  serial_mesh = MESH_New(UNKNOWN_REP);
 	  fprintf(stderr,"Reading file in MSTK format...");
+          double import_t0 = meshconvert_wtime();
 	  ok = MESH_InitFromFile(serial_mesh,infname,comm);
+          double import_t1 = meshconvert_wtime();
+          if (timing)
+            meshconvert_print_time("MESH_InitFromFile", import_t0, import_t1,
+                                   rank, NULL);
 	  fprintf(stderr,"Done\n");
 	  break;
 	}
 	case GMV: {
 	  fprintf(stderr,"Importing mesh from GMV file...");
 	  serial_mesh = MESH_New(F1);
+          double import_t0 = meshconvert_wtime();
 	  ok = MESH_ImportFromFile(serial_mesh,infname,"gmv",opts,comm);
+          double import_t1 = meshconvert_wtime();
+          if (timing)
+            meshconvert_print_time("MESH_ImportFromFile", import_t0, import_t1,
+                                   rank, NULL);
 	  break;
 	}
 	case X3D: {
 	  fprintf(stderr,"Importing mesh from X3D format...");
 	  serial_mesh = MESH_New(F1);
+          double import_t0 = meshconvert_wtime();
 	  ok = MESH_ImportFromFile(serial_mesh,infname,"x3d",opts,comm);
+          double import_t1 = meshconvert_wtime();
+          if (timing)
+            meshconvert_print_time("MESH_ImportFromFile", import_t0, import_t1,
+                                   rank, NULL);
 	  break;
 	}
 	case CGNS: case VTK: case AVSUCD: 
@@ -326,8 +459,15 @@ int main(int argc, char *argv[]) {
 
 #ifdef MSTK_HAVE_MPI
 	MPI_Bcast(&dim, 1, MPI_INT, 0, comm);
+        double dist_t0 = meshconvert_wtime();
 	int ok = MSTK_Mesh_Distribute(serial_mesh, &mesh, &dim, ring, with_attr,
 				      partmethod, del_inmesh, comm);
+        double dist_t1 = meshconvert_wtime();
+        if (timing) {
+          meshconvert_print_time("MSTK_Mesh_Distribute", dist_t0, dist_t1,
+                                 rank, comm);
+          meshconvert_print_memory("after MSTK_Mesh_Distribute", rank, comm);
+        }
 #else
         MSTK_Report("meshconvert",
                     "Request for partitioning in serial run - use mpirun",
@@ -343,7 +483,12 @@ int main(int argc, char *argv[]) {
       if (rank == 0) {
 	fprintf(stderr,"Building classification information....");
 	
+        double class_t0 = meshconvert_wtime();
 	ok = MESH_BuildClassfn(mesh,use_geometry);  
+        double class_t1 = meshconvert_wtime();
+        if (timing)
+          meshconvert_print_time("MESH_BuildClassfn", class_t0, class_t1,
+                                 rank, NULL);
 
 	if (ok)
 	  fprintf(stderr,"Done\n");
@@ -360,7 +505,12 @@ int main(int argc, char *argv[]) {
       if (rank == 0) {
 	fprintf(stderr,"Checking mesh topology....");
 
+        double topo_t0 = meshconvert_wtime();
 	ok = MESH_CheckTopo(mesh);
+        double topo_t1 = meshconvert_wtime();
+        if (timing)
+          meshconvert_print_time("MESH_CheckTopo", topo_t0, topo_t1,
+                                 rank, NULL);
 	
 	if (ok)
 	  fprintf(stderr,"Done\n");
@@ -382,7 +532,12 @@ int main(int argc, char *argv[]) {
       sprintf(parfilename,"%s.%-d.%-d",infname,numprocs,rank);
       mesh = MESH_New(UNKNOWN_REP);
       
+      double import_t0 = meshconvert_wtime();
       ok = MESH_InitFromFile(mesh,parfilename,comm);
+      double import_t1 = meshconvert_wtime();
+      if (timing)
+        meshconvert_print_time("MESH_InitFromFile", import_t0, import_t1,
+                               rank, comm);
       
       break;
     }
@@ -393,7 +548,12 @@ int main(int argc, char *argv[]) {
       sprintf(parfilename,"%s.%05d",infname,rank+1);
       mesh = MESH_New(F1);
       
+      double import_t0 = meshconvert_wtime();
       ok = MESH_ImportFromFile(mesh,parfilename,"gmv",opts,comm);
+      double import_t1 = meshconvert_wtime();
+      if (timing)
+        meshconvert_print_time("MESH_ImportFromFile", import_t0, import_t1,
+                               rank, comm);
 
       break;
     }
@@ -404,7 +564,12 @@ int main(int argc, char *argv[]) {
       sprintf(parfilename,"%s.%-d.%-d",infname,numprocs,rank);
       mesh = MESH_New(UNKNOWN_REP);
       
+      double import_t0 = meshconvert_wtime();
       ok = MESH_ImportFromFile(mesh,parfilename,"nemesisi",opts,comm);
+      double import_t1 = meshconvert_wtime();
+      if (timing)
+        meshconvert_print_time("MESH_ImportFromFile", import_t0, import_t1,
+                               rank, comm);
       
       break;
     }
@@ -430,7 +595,12 @@ int main(int argc, char *argv[]) {
       sprintf(parfilename,"%s.%05d",infname,rank+1);
       mesh = MESH_New(F1);
 
+      double import_t0 = meshconvert_wtime();
       ok = MESH_ImportFromFile(mesh,parfilename,"x3d",opts,comm);
+      double import_t1 = meshconvert_wtime();
+      if (timing)
+        meshconvert_print_time("MESH_ImportFromFile", import_t0, import_t1,
+                               rank, comm);
 
       break;
     }
@@ -457,8 +627,13 @@ int main(int argc, char *argv[]) {
 
       int num_ghost_layers = 1;
       int dim = MESH_Num_Regions(mesh) ? 3 : 2;
+      double weave_t0 = meshconvert_wtime();
       MSTK_Weave_DistributedMeshes(mesh, dim, num_ghost_layers, input_type,
 				   comm);
+      double weave_t1 = meshconvert_wtime();
+      if (timing)
+        meshconvert_print_time("MSTK_Weave_DistributedMeshes", weave_t0,
+                               weave_t1, rank, comm);
 
     }
     
@@ -467,7 +642,12 @@ int main(int argc, char *argv[]) {
       /* Do a parallel consistency check too */
       /* Not checking the mesh geometry here */
       
+      double pcheck_t0 = meshconvert_wtime();
       ok = ok && MESH_Parallel_Check(mesh,comm);
+      double pcheck_t1 = meshconvert_wtime();
+      if (timing)
+        meshconvert_print_time("MESH_Parallel_Check", pcheck_t0, pcheck_t1,
+                               rank, comm);
       
       int allok = 0;
       MPI_Reduce(&ok,&allok,1,MPI_INT,MPI_MIN,0,comm);
@@ -486,10 +666,16 @@ int main(int argc, char *argv[]) {
   if (outmeshfmt == MSTK) {
     if (rank == 0)
       fprintf(stderr,"Writing mesh to MSTK file...");
+    double export_t0 = meshconvert_wtime();
     MESH_WriteToFile(mesh,outfname,MESH_RepType(mesh),comm);
+    double export_t1 = meshconvert_wtime();
+    if (timing)
+      meshconvert_print_time("MESH_WriteToFile", export_t0, export_t1,
+                             rank, comm);
     fprintf(stderr,"Done\n");
   }
   else {
+    double export_t0 = meshconvert_wtime();
     switch(outmeshfmt) {
     case GMV:
       if (rank == 0)
@@ -537,6 +723,12 @@ int main(int argc, char *argv[]) {
       if (rank == 0)
         fprintf(stderr,"Cannot export mesh to unrecognized format. \n");      
     }
+    double export_t1 = meshconvert_wtime();
+    if (timing) {
+      meshconvert_print_time("MESH_ExportToFile", export_t0, export_t1,
+                             rank, comm);
+      meshconvert_print_memory("after MESH_ExportToFile", rank, comm);
+    }
 
     if (rank == 0) {
       if (ok)
@@ -550,6 +742,11 @@ int main(int argc, char *argv[]) {
 
 
   MESH_Delete(mesh);
+  if (timing) {
+    double total_t1 = meshconvert_wtime();
+    meshconvert_print_time("total", total_t0, total_t1, rank, comm);
+    meshconvert_print_memory("before MPI_Finalize", rank, comm);
+  }
  
 #ifdef MSTK_HAVE_MPI
   MPI_Finalize();

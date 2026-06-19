@@ -11,6 +11,7 @@ https://github.com/MeshToolkit/MSTK/blob/master/LICENSE
 #include <string.h>
 #include <strings.h>
 #include <math.h>
+#include <sys/time.h>
 
 #include "MSTK.h"
 #include "MSTK_private.h"
@@ -24,6 +25,17 @@ https://github.com/MeshToolkit/MSTK/blob/master/LICENSE
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+  static int exo_serial_timing_enabled(void) {
+    const char *val = getenv("MSTK_MESHCONVERT_TIMING");
+    return (val && val[0] != '\0' && val[0] != '0');
+  }
+
+  static double exo_serial_wtime(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return ((double) tv.tv_sec) + 1.0e-6*((double) tv.tv_usec);
+  }
 
 
   /* Read a single Exodus II (or Nemesis) file on one processor into MSTK */
@@ -39,6 +51,26 @@ extern "C" {
      - Should we pick one of the first two? */
 
 #define DEF_MAXFACES 20
+
+  static int exo_serial_preserve_named_sidesets(void) {
+    const char *val = getenv("MSTK_PRESERVE_NAMED_SIDESETS");
+    return (val && val[0] != '\0' && val[0] != '0');
+  }
+
+  static void exo_serial_make_sideset_mset_name(char *sidesetname,
+                                                size_t sidesetname_len,
+                                                int sideset_id) {
+    char original_name[256];
+
+    if (!exo_serial_preserve_named_sidesets()) return;
+    if (!sidesetname || sidesetname[0] == '\0') return;
+    if (strncmp(sidesetname,"sideset_",8) == 0) return;
+
+    strncpy(original_name,sidesetname,sizeof(original_name));
+    original_name[sizeof(original_name)-1] = '\0';
+    snprintf(sidesetname,sidesetname_len,"sideset_%d__%s",
+             sideset_id, original_name);
+  }
 
 
   int MESH_ReadExodusII_Serial(Mesh_ptr mesh, const char *filename, const int rank) {
@@ -88,12 +120,13 @@ extern "C" {
     MAttrib_ptr nmapatt=NULL, elblockatt=NULL, nodesetatt=NULL, sidesetatt=NULL;
     MSet_ptr faceset=NULL, nodeset=NULL, sideset=NULL, matset=NULL;
     int distributed=0;
+    int timing = exo_serial_timing_enabled();
   
     ex_init_params exopar;
 
     FILE *fp;
 
-        
+    double header_t0 = exo_serial_wtime();
     exoid = ex_open(filename, EX_READ, &comp_ws, &io_ws, &version);
 
     if (exoid < 0) {
@@ -106,6 +139,7 @@ extern "C" {
       sprintf(mesg,"Error while reading Exodus II file %s\n",filename);
       MSTK_Report(funcname,mesg,MSTK_FATAL);
     }
+    double header_t1 = exo_serial_wtime();
   
   
     strcpy(title,exopar.title);
@@ -126,6 +160,15 @@ extern "C" {
     nedgemaps = exopar.num_edge_maps;
     nfacemaps = exopar.num_face_maps;
     nelemmaps = exopar.num_elem_maps;
+
+    if (timing) {
+      fprintf(stderr,
+              "[meshconvert][timing] %-36s %10.3f s\n",
+              "Exodus header read", header_t1 - header_t0);
+      fprintf(stderr,
+              "[meshconvert][timing] Exodus counts nodes=%d elems=%d elem_blocks=%d node_sets=%d side_sets=%d elem_sets=%d\n",
+              nnodes, nelems, nelblock, nnodesets, nsidesets, nelemsets);
+    }
   
   
   
@@ -133,6 +176,7 @@ extern "C" {
   
     /* read the vertex information */
   
+    double coord_t0 = exo_serial_wtime();
     xvals = (double *) malloc(nnodes*sizeof(double));
     yvals = (double *) malloc(nnodes*sizeof(double));  
     if (ndim == 2)
@@ -158,6 +202,11 @@ extern "C" {
     free(xvals);
     free(yvals);
     free(zvals);
+    double coord_t1 = exo_serial_wtime();
+    if (timing)
+      fprintf(stderr,
+              "[meshconvert][timing] %-36s %10.3f s\n",
+              "coordinate read/build", coord_t1 - coord_t0);
   
 
     /* read node number map - store it as an attribute to spit out later
@@ -197,6 +246,8 @@ extern "C" {
     /* Read node sets */
 
     if (nnodesets) {
+      double nodeset_t0 = exo_serial_wtime();
+      long long total_nodeset_entries = 0;
       nodeset_ids = (int *) malloc(nnodesets*sizeof(int));
 
 #ifdef EXODUS_6_DEPRECATED
@@ -227,6 +278,7 @@ extern "C" {
         status = ex_get_set_param(exoid, EX_NODE_SET, nodeset_ids[i],
                                   &num_nodes_in_set, &num_df_in_set);
 #endif
+        total_nodeset_entries += num_nodes_in_set;
       
         ns_node_list = (int *) malloc(num_nodes_in_set*sizeof(int));
       
@@ -259,6 +311,12 @@ extern "C" {
       }
     
       free(nodeset_ids);
+      double nodeset_t1 = exo_serial_wtime();
+      if (timing)
+        fprintf(stderr,
+                "[meshconvert][timing] %-36s %10.3f s sets=%d entries=%lld\n",
+                "node-set read/build", nodeset_t1 - nodeset_t0,
+                nnodesets, total_nodeset_entries);
       
     }
 
@@ -526,6 +584,9 @@ extern "C" {
       /* Read side sets */
 
       if (nsidesets) {
+        double sideset_t0 = exo_serial_wtime();
+        long long total_sideset_entries = 0;
+        int min_sideset_size = -1, max_sideset_size = 0;
 
         sideset_ids = (int *) malloc(nsidesets*sizeof(int));
      
@@ -547,6 +608,8 @@ extern "C" {
           status = ex_get_name(exoid, EX_SIDE_SET, sideset_ids[i], sidesetname);
           if (status != 0 || strlen(sidesetname) == 0)  // No name assigned - make up one
             sprintf(sidesetname,"sideset_%-d",sideset_ids[i]);
+          exo_serial_make_sideset_mset_name(sidesetname, sizeof(sidesetname),
+                                            sideset_ids[i]);
 	
           sidesetatt = MAttrib_New(mesh,sidesetname,INT,MEDGE);
           sideset = MSet_New(mesh,sidesetname,MEDGE);
@@ -558,6 +621,11 @@ extern "C" {
           status = ex_get_set_param(exoid, EX_SIDE_SET, sideset_ids[i],
                                     &num_sides_in_set, &num_df_in_set);
 #endif
+          total_sideset_entries += num_sides_in_set;
+          if (min_sideset_size < 0 || num_sides_in_set < min_sideset_size)
+            min_sideset_size = num_sides_in_set;
+          if (num_sides_in_set > max_sideset_size)
+            max_sideset_size = num_sides_in_set;
 	
           ss_elem_list = (int *) malloc(num_sides_in_set*sizeof(int));
           ss_side_list = (int *) malloc(num_sides_in_set*sizeof(int));
@@ -604,6 +672,15 @@ extern "C" {
         }
 
         free(sideset_ids);
+        double sideset_t1 = exo_serial_wtime();
+        if (timing)
+          fprintf(stderr,
+                  "[meshconvert][timing] %-36s %10.3f s sets=%d entries=%lld min=%d mean=%.1f max=%d\n",
+                  "side-set read/build (2D)", sideset_t1 - sideset_t0,
+                  nsidesets, total_sideset_entries,
+                  min_sideset_size < 0 ? 0 : min_sideset_size,
+                  nsidesets ? ((double) total_sideset_entries)/nsidesets : 0.0,
+                  max_sideset_size);
       }
 
 
@@ -1597,6 +1674,9 @@ extern "C" {
       /* Read side sets */
 
       if (nsidesets) {
+        double sideset_t0 = exo_serial_wtime();
+        long long total_sideset_entries = 0;
+        int min_sideset_size = -1, max_sideset_size = 0;
 
         if (mesh_type == 3)
           MSTK_Report(funcname,"Cannot handle sidesets in meshes with surface and solid elements",MSTK_FATAL);
@@ -1621,6 +1701,8 @@ extern "C" {
           status = ex_get_name(exoid, EX_SIDE_SET, sideset_ids[i], sidesetname);
           if (status != 0 || strlen(sidesetname) == 0)  // No name assigned - make up one
             sprintf(sidesetname,"sideset_%-d",sideset_ids[i]);
+          exo_serial_make_sideset_mset_name(sidesetname, sizeof(sidesetname),
+                                            sideset_ids[i]);
 	
 #ifdef EXODUS_6_DEPRECATED
           status = ex_get_side_set_param(exoid,sideset_ids[i],&num_sides_in_set,
@@ -1629,6 +1711,11 @@ extern "C" {
           status = ex_get_set_param(exoid, EX_SIDE_SET, sideset_ids[i],
                                     &num_sides_in_set, &num_df_in_set);
 #endif
+          total_sideset_entries += num_sides_in_set;
+          if (min_sideset_size < 0 || num_sides_in_set < min_sideset_size)
+            min_sideset_size = num_sides_in_set;
+          if (num_sides_in_set > max_sideset_size)
+            max_sideset_size = num_sides_in_set;
 	
           ss_elem_list = (int *) malloc(num_sides_in_set*sizeof(int));
           ss_side_list = (int *) malloc(num_sides_in_set*sizeof(int));
@@ -1763,6 +1850,15 @@ extern "C" {
         }
 
         free(sideset_ids);
+        double sideset_t1 = exo_serial_wtime();
+        if (timing)
+          fprintf(stderr,
+                  "[meshconvert][timing] %-36s %10.3f s sets=%d entries=%lld min=%d mean=%.1f max=%d\n",
+                  "side-set read/build (3D)", sideset_t1 - sideset_t0,
+                  nsidesets, total_sideset_entries,
+                  min_sideset_size < 0 ? 0 : min_sideset_size,
+                  nsidesets ? ((double) total_sideset_entries)/nsidesets : 0.0,
+                  max_sideset_size);
       }
 
       /* Read element sets */

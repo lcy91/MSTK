@@ -18,6 +18,96 @@ https://github.com/MeshToolkit/MSTK/blob/master/LICENSE
 extern "C" {
 #endif
 
+  static int partition_send_timing_enabled(void) {
+    const char *val = getenv("MSTK_MESHCONVERT_TIMING");
+    return (val && val[0] != '\0' && val[0] != '0');
+  }
+
+  static void partition_send_print_time(const char *label, double t0,
+                                        double t1, int rank) {
+    if (rank == 0)
+      fprintf(stderr, "[meshconvert][timing] %-36s %10.3f s\n",
+              label, t1 - t0);
+  }
+
+  static int partition_send_skip_side_set_attr_copy(void) {
+    const char *val = getenv("MSTK_SKIP_SIDE_SET_ATTR_COPY");
+    return (val && val[0] != '\0' && val[0] != '0');
+  }
+
+  static int partition_send_batched_set_copy(void) {
+    const char *val = getenv("MSTK_BATCHED_SET_COPY");
+    return (val && val[0] != '\0' && val[0] != '0');
+  }
+
+  static int MESH_CopySets_Batched(Mesh_ptr parentmesh, int num,
+                                   Mesh_ptr *submeshes, int nset_global,
+                                   char (*msetnames)[256], int timing,
+                                   int rank) {
+    MAttrib_ptr g2latt = MESH_AttribByName(parentmesh,"Global2Local");
+    if (!g2latt)
+      MSTK_Report("MESH_CopySets_Batched",
+                  "Missing Global2Local attribute", MSTK_FATAL);
+
+    MSet_ptr *local_sets =
+      (MSet_ptr *) calloc(((size_t) nset_global)*num, sizeof(MSet_ptr));
+    if (!local_sets)
+      MSTK_Report("MESH_CopySets_Batched",
+                  "Could not allocate local set lookup table", MSTK_FATAL);
+
+    long long total_entries = 0;
+    long long total_local_entries = 0;
+    double t0 = MPI_Wtime();
+
+    for (int m = 0; m < nset_global; m++) {
+      MSet_ptr gmset = MESH_MSet(parentmesh,m);
+      MType mtype = MSet_EntDim(gmset);
+      MEntity_ptr gment, lment;
+      int idx = 0;
+
+      while ((gment = MSet_Next_Entry(gmset,&idx))) {
+        List_ptr lmentlist;
+        MEnt_Get_AttVal(gment,g2latt,0,0,&lmentlist);
+        if (!lmentlist) continue;
+        total_entries++;
+
+        int idx2 = 0;
+        while ((lment = List_Next_Entry(lmentlist,&idx2))) {
+          Mesh_ptr submesh = MEnt_Mesh(lment);
+
+          for (int i = 0; i < num; ++i) {
+            if (submesh == submeshes[i]) {
+              size_t loc = ((size_t) m)*num + i;
+              MSet_ptr lmset = local_sets[loc];
+              if (!lmset) {
+                lmset = MESH_MSetByName(submeshes[i],msetnames[m]);
+                if (!lmset)
+                  lmset = MSet_New(submeshes[i],msetnames[m],mtype);
+                local_sets[loc] = lmset;
+              }
+              MSet_Add(lmset,lment);
+              total_local_entries++;
+              break;
+            }
+          }
+        }
+      }
+
+      if (timing && rank == 0 && (m+1)%10000 == 0)
+        fprintf(stderr,
+                "[meshconvert][timing] rank0 batched set copy progress sets=%d/%d elapsed=%10.3f s\n",
+                m+1, nset_global, MPI_Wtime() - t0);
+    }
+
+    if (timing && rank == 0)
+      fprintf(stderr,
+              "[meshconvert][timing] rank0 batched set copy stats global_entries=%lld local_entries=%lld\n",
+              total_entries, total_local_entries);
+
+    free(local_sets);
+    return 1;
+  }
+
   /* 
      Partition a mesh into as many submeshes as requested and distribute them
 
@@ -52,6 +142,11 @@ extern "C" {
     int torank;
     
     char funcname[256] = "MESH_Partition_And_Send";
+    int timing = partition_send_timing_enabled();
+    int skip_side_set_attrs = partition_send_skip_side_set_attr_copy();
+    int batched_set_copy = partition_send_batched_set_copy();
+    double t0, t1;
+    int skipped_side_set_attrs = 0;
 
 
     MPI_Comm_rank(comm,&rank);
@@ -76,8 +171,13 @@ extern "C" {
 
     /* Split the mesh into 'num' submeshes */
 
+    t0 = MPI_Wtime();
     MESH_Partition(parentmesh, num, part, submeshes);
+    t1 = MPI_Wtime();
+    if (timing)
+      partition_send_print_time("rank0 MESH_Partition", t0, t1, rank);
 
+    t0 = MPI_Wtime();
     for (i = 0; i < num; i++) {
       /* Tag entities as being in the partition interior or on the
          partition boundary */
@@ -88,6 +188,10 @@ extern "C" {
 
       MESH_AddGhost(parentmesh,submeshes[i],i,ring);
     }
+    t1 = MPI_Wtime();
+    if (timing)
+      partition_send_print_time("rank0 boundary+ghost submeshes", t0, t1,
+                                rank);
 
 
     /* Send/receive mesh */
@@ -98,6 +202,7 @@ extern "C" {
 
     /* Send Mesh Meta Data */
     
+    t0 = MPI_Wtime();
     for (n = 0; n < num; n++) {
       torank = toranks[n];
       if (torank == rank) continue;
@@ -121,12 +226,16 @@ extern "C" {
         }
       }	
     }
+    t1 = MPI_Wtime();
+    if (timing)
+      partition_send_print_time("rank0 send mesh metadata", t0, t1, rank);
 
 
 
 
     /* Send Mesh Vertices */
 
+    t0 = MPI_Wtime();
     for (n = 0; n < num; n++) {
       torank = toranks[n];
       if (torank == rank) continue;
@@ -145,10 +254,14 @@ extern "C" {
         }
       }	
     }
+    t1 = MPI_Wtime();
+    if (timing)
+      partition_send_print_time("rank0 send vertices", t0, t1, rank);
 
 
     /* Send Mesh Vertices */
 
+    t0 = MPI_Wtime();
     for (n = 0; n < num; n++) {
       torank = toranks[n];
       if (torank == rank) continue;
@@ -167,11 +280,15 @@ extern "C" {
         }
       }	
     }
+    t1 = MPI_Wtime();
+    if (timing)
+      partition_send_print_time("rank0 send vertex coords", t0, t1, rank);
 
 
 
     /* Send higher dimensional mesh entities  */
 
+    t0 = MPI_Wtime();
     for (n = 0; n < num; n++) {
       torank = toranks[n];
       if (torank == rank) continue;
@@ -190,6 +307,10 @@ extern "C" {
         }
       }	
     }
+    t1 = MPI_Wtime();
+    if (timing)
+      partition_send_print_time("rank0 send non-vertex entities", t0, t1,
+                                rank);
 
 
 
@@ -203,7 +324,9 @@ extern "C" {
       int natt_global = MESH_Num_Attribs(parentmesh);
       char (*attnames)[256] = 
         (char (*)[256]) malloc(natt_global*sizeof(char [256]));
+      MType side_dim = MESH_Num_Regions(parentmesh) ? MFACE : MEDGE;
 
+      t0 = MPI_Wtime();
       for (a = 0; a < natt_global; a++) {
         attrib = MESH_Attrib(parentmesh,a);          
 
@@ -212,12 +335,26 @@ extern "C" {
 
         atttype = MAttrib_Get_Type(attrib);
         if (atttype == POINTER) continue;
+        if (skip_side_set_attrs && atttype == INT &&
+            MAttrib_Get_EntDim(attrib) == side_dim) {
+          skipped_side_set_attrs++;
+          continue;
+        }
           
         MESH_CopyAttr(parentmesh,num,submeshes,attnames[a]);
       }        
+      t1 = MPI_Wtime();
+      if (timing) {
+        partition_send_print_time("rank0 copy attributes", t0, t1, rank);
+        if (skip_side_set_attrs && rank == 0)
+          fprintf(stderr,
+                  "[meshconvert][timing] skipped side-dim INT attrs=%d\n",
+                  skipped_side_set_attrs);
+      }
 
       /* Send Attribute meta data */
 
+      t0 = MPI_Wtime();
       for (n = 0; n < num; n++) {
         torank = toranks[n];
         if (torank == rank) continue;
@@ -236,10 +373,15 @@ extern "C" {
           }
         }	
       }
+      t1 = MPI_Wtime();
+      if (timing)
+        partition_send_print_time("rank0 send attribute metadata", t0, t1,
+                                  rank);
 
 
       /* Send each attribute to the various processors */
 
+      t0 = MPI_Wtime();
       for (a = 0; a < natt_global; a++) {
           
         for (n = 0; n < num; n++) {
@@ -268,6 +410,9 @@ extern "C" {
           }	
         }
       }
+      t1 = MPI_Wtime();
+      if (timing)
+        partition_send_print_time("rank0 send attributes", t0, t1, rank);
           
      
         
@@ -277,14 +422,29 @@ extern "C" {
       char (*msetnames)[256] = 
         (char (*)[256]) malloc(nset_global*sizeof(char [256]));
 
+      t0 = MPI_Wtime();
       for (m = 0; m < nset_global; m++) {
         mset = MESH_MSet(parentmesh,m);
         MSet_Name(mset,msetnames[m]);
-        MESH_CopySet(parentmesh,num,submeshes,mset);
       }
+      if (batched_set_copy)
+        MESH_CopySets_Batched(parentmesh, num, submeshes, nset_global,
+                              msetnames, timing, rank);
+      else
+        for (m = 0; m < nset_global; m++) {
+          mset = MESH_MSet(parentmesh,m);
+          MESH_CopySet(parentmesh,num,submeshes,mset);
+        }
+      t1 = MPI_Wtime();
+      if (timing)
+        fprintf(stderr,
+                "[meshconvert][timing] %-36s %10.3f s sets=%d mode=%s\n",
+                "rank0 copy mesh sets", t1 - t0, nset_global,
+                batched_set_copy ? "batched" : "per-set");
         
       /* Send Mesh Set Meta Data */
 
+      t0 = MPI_Wtime();
       for (n = 0; n < num; n++) {
         torank = toranks[n];
         if (torank == rank) continue;
@@ -308,46 +468,79 @@ extern "C" {
           }
         }	
       }
+      t1 = MPI_Wtime();
+      if (timing)
+        partition_send_print_time("rank0 send mesh-set metadata", t0, t1,
+                                  rank);
         
         
       /* Send Mesh Sets */
         
-      for (m = 0; m < nset_global; m++) {
-          
+      t0 = MPI_Wtime();
+      if (batched_set_copy) {
+        if (numreq) {
+          if (MPI_Waitall(numreq,requests,MPI_STATUSES_IGNORE) != MPI_SUCCESS)
+            MSTK_Report("MSTK_Mesh_Distribute","Could not send mesh",MSTK_FATAL);
+          else {
+            numreq = 0;
+            for (p = 0; p < numptrs2free; ++p) free(ptrs2free[p]);
+            numptrs2free = 0;
+          }
+        }
+
         for (n = 0; n < num; n++) {
           torank = toranks[n];
           if (torank == rank) continue;
-            
-          mset = MESH_MSetByName(submeshes[torank],msetnames[m]);
-          if (!mset) continue; /* this mset does not exist on this processor */
-            
-          MESH_Send_MSet(submeshes[torank], mset, torank, comm,
-                         &numreq, &maxreq, &requests,
-                         &numptrs2free, &maxptrs2free, &ptrs2free);
-            
-          if (numreq > maxpendreq) {
-            if (MPI_Waitall(numreq,requests,MPI_STATUSES_IGNORE) != MPI_SUCCESS)
-              MSTK_Report("MSTK_Mesh_Distribute","Could not send mesh",MSTK_FATAL);
-            else {
-              numreq = 0;
-              for (p = 0; p < numptrs2free; ++p) free(ptrs2free[p]);
-              numptrs2free = 0;
-            }
-          }	
+
+          MESH_Send_MSets_Batched(submeshes[torank], torank, comm);
         }
-          
       }
+      else {
+        for (n = 0; n < num; n++) {
+          torank = toranks[n];
+          if (torank == rank) continue;
+
+          int nset_local = MESH_Num_MSets(submeshes[torank]);
+          for (m = 0; m < nset_local; m++) {
+            mset = MESH_MSet(submeshes[torank],m);
+
+            MESH_Send_MSet(submeshes[torank], mset, torank, comm,
+                           &numreq, &maxreq, &requests,
+                           &numptrs2free, &maxptrs2free, &ptrs2free);
+
+            if (numreq > maxpendreq) {
+              if (MPI_Waitall(numreq,requests,MPI_STATUSES_IGNORE) != MPI_SUCCESS)
+                MSTK_Report("MSTK_Mesh_Distribute","Could not send mesh",MSTK_FATAL);
+              else {
+                numreq = 0;
+                for (p = 0; p < numptrs2free; ++p) free(ptrs2free[p]);
+                numptrs2free = 0;
+              }
+            }
+          }
+
+        }
+      }
+      t1 = MPI_Wtime();
+      if (timing)
+        partition_send_print_time("rank0 send mesh sets", t0, t1, rank);
     }
 
 
+    t0 = MPI_Wtime();
     if (*mysubmesh == NULL)
       *mysubmesh = submeshes[rank];
     else
       MESH_Copy(submeshes[rank],*mysubmesh,1,1);
+    t1 = MPI_Wtime();
+    if (timing)
+      partition_send_print_time("rank0 keep/copy local submesh", t0, t1,
+                                rank);
 
 
     /* Final flush of all requests */
 
+    t0 = MPI_Wtime();
     if (numreq) {
       if (MPI_Waitall(numreq,requests,MPI_STATUSES_IGNORE) != MPI_SUCCESS)
         MSTK_Report("MSTK_Mesh_Distribute","Could not send mesh",MSTK_FATAL);
@@ -357,6 +550,9 @@ extern "C" {
         numptrs2free = 0;
       }
     }
+    t1 = MPI_Wtime();
+    if (timing)
+      partition_send_print_time("rank0 final MPI wait", t0, t1, rank);
       
     if (maxptrs2free) free(ptrs2free);
     if (maxreq) free(requests);
@@ -402,11 +598,15 @@ extern "C" {
       if (g2llist) List_Delete(g2llist);
     }	
 	
+    t0 = MPI_Wtime();
     if (del_inmesh) MESH_Delete(parentmesh);
+    t1 = MPI_Wtime();
+    if (timing)
+      partition_send_print_time("rank0 cleanup/delete parent", t0, t1,
+                                rank);
     return 1;
   }
 
 #ifdef __cplusplus
 }
 #endif
-
