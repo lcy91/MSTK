@@ -79,6 +79,51 @@ extern "C" {
     dst[dstlen-1] = '\0';
   }
 
+  static int exo_export_trailing_id(const char *name, int *id) {
+    const char *p;
+    char *endptr;
+    long val;
+
+    if (!name || !id) return 0;
+
+    p = name + strlen(name);
+    while (p > name && p[-1] >= '0' && p[-1] <= '9') p--;
+    if (*p == '\0') return 0;
+    if (p == name || p[-1] != '_') return 0;
+
+    val = strtol(p, &endptr, 10);
+    if (*endptr != '\0') return 0;
+
+    *id = (int) val;
+    return 1;
+  }
+
+  static MRegion_ptr exo_export_matching_sideset_region(
+      MFace_ptr mf, List_ptr fregs, const char *sideset_name,
+      int num_element_set_glob, MSet_ptr *element_sets_glob,
+      int *element_set_ids_glob) {
+    int setid, i, j, nfregs;
+
+    if (!mf || !fregs || !sideset_name || !element_sets_glob ||
+        !element_set_ids_glob)
+      return NULL;
+    if (!exo_export_trailing_id(sideset_name, &setid)) return NULL;
+
+    nfregs = List_Num_Entries(fregs);
+    for (i = 0; i < num_element_set_glob; i++) {
+      if (element_set_ids_glob[i] != setid) continue;
+      if (!element_sets_glob[i]) return NULL;
+
+      for (j = 0; j < nfregs; j++) {
+        MRegion_ptr cand = List_Entry(fregs,j);
+        if (cand && MSet_Contains(element_sets_glob[i], cand))
+          return cand;
+      }
+    }
+
+    return NULL;
+  }
+
   /* this function collects element block inforamtion based on element type */
   void MESH_Get_Element_Block_Info(Mesh_ptr mesh, 
                                    int *num_element_blocks_glob,
@@ -1179,6 +1224,14 @@ extern "C" {
 #endif
       char sideset_output_name[256];
 
+      sideset_output_name[0] = '\0';
+      if (side_set_names_glob && side_set_names_glob[i])
+        exo_export_copy_name(sideset_output_name, side_set_names_glob[i],
+                             sizeof(sideset_output_name));
+      if (sideset_output_name[0] == '\0')
+        exo_export_sideset_name(side_sets_glob[i], sideset_output_name,
+                                sizeof(sideset_output_name));
+
       int nsides = 0;
       if (nrowned) {        
 	idx = 0;
@@ -1191,11 +1244,25 @@ extern "C" {
 	    MSTK_Report("MESH_ExportToEXODUSII",
 			"Standalone face with no regions in side set",
 			MSTK_FATAL);
-	  mr = List_Entry(fregs,0);
+	  mr = exo_export_matching_sideset_region(mf, fregs,
+                                                  sideset_output_name,
+                                                  num_element_set_glob,
+                                                  element_sets_glob,
+                                                  element_set_ids_glob);
+          if (!mr)
+            mr = List_Entry(fregs,0);
 
 #ifdef MSTK_HAVE_MPI
           if (comm && MR_PType(mr) == PGHOST) {
-            if (List_Num_Entries(fregs) > 1)
+            MRegion_ptr owned_mr =
+              exo_export_matching_sideset_region(mf, fregs,
+                                                  sideset_output_name,
+                                                  num_element_set_glob,
+                                                  element_sets_glob,
+                                                  element_set_ids_glob);
+            if (owned_mr && MR_PType(owned_mr) != PGHOST)
+              mr = owned_mr;
+            else if (List_Num_Entries(fregs) > 1)
               mr = List_Entry(fregs,1);  /* at least 1 region should be owned */
             else  // First check in loop should prevent it from coming here
               MSTK_Report("MESH_ExportToExodusII", "Trying to write out ghost side set face thats not on the parallel boundary", MSTK_FATAL);
@@ -1288,14 +1355,7 @@ extern "C" {
       if (!side_set_output_names[i])
         MSTK_Report("MESH_ExportToExodusII",
                     "Could not allocate side set name buffer", MSTK_FATAL);
-      if (side_set_names_glob && side_set_names_glob[i])
-        exo_export_copy_name(side_set_output_names[i], side_set_names_glob[i],
-                             256);
-      else
-        exo_export_sideset_name(side_sets_glob[i], sideset_output_name,
-                                sizeof(sideset_output_name));
-      if ((!side_set_names_glob || !side_set_names_glob[i]) &&
-          sideset_output_name[0] != '\0')
+      if (sideset_output_name[0] != '\0')
         exo_export_copy_name(side_set_output_names[i], sideset_output_name,
                              256);
 #endif
