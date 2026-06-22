@@ -21,6 +21,8 @@ https://github.com/MeshToolkit/MSTK/blob/master/LICENSE
 
 #include "MSTK.h"
 
+#define MSTK_ATS_ORIG_ELEM_GID_ATT "MSTK_ATS_ORIG_ELEM_GID"
+
 static double meshconvert_wtime(void) {
   struct timeval tv;
   gettimeofday(&tv, NULL);
@@ -437,6 +439,25 @@ int main(int argc, char *argv[]) {
           MSTK_Report("meshconvert",
                       "ATS workflow MSTK_Mesh_Distribute failed",
                       MSTK_FATAL);
+
+        if (experimental_sparse_sideset_export) {
+          MAttrib_ptr orig_gid_att =
+            MAttrib_New(mesh,MSTK_ATS_ORIG_ELEM_GID_ATT,INT,MREGION);
+          MRegion_ptr mr;
+          int idx = 0;
+
+          if (!orig_gid_att)
+            MSTK_Report("meshconvert",
+                        "Could not create original Exodus element id attribute",
+                        MSTK_FATAL);
+
+          while ((mr = MESH_Next_Region(mesh,&idx)))
+            if (MR_PType(mr) != PGHOST)
+              MEnt_Set_AttVal(mr,orig_gid_att,MR_GlobalID(mr),0.0,NULL);
+
+          setenv("MSTK_SPARSE_SIDESET_OWNER_ATTR",
+                 MSTK_ATS_ORIG_ELEM_GID_ATT,1);
+        }
 
         double gid_t0 = meshconvert_wtime();
         ok = MESH_Renumber_GlobalIDs(mesh,MALLTYPE,0,NULL,comm);

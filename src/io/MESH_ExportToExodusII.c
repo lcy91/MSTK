@@ -328,6 +328,27 @@ extern "C" {
     return filename;
   }
 
+  static MAttrib_ptr exo_export_sparse_owner_attr(Mesh_ptr mesh) {
+    const char *attr_name = getenv("MSTK_SPARSE_SIDESET_OWNER_ATTR");
+    if (!mesh || !attr_name || attr_name[0] == '\0')
+      return NULL;
+    return MESH_AttribByName(mesh,attr_name);
+  }
+
+  static int exo_export_region_owner_key(MRegion_ptr mr,
+                                         MAttrib_ptr owner_att) {
+    int owner_key = 0;
+    double rval = 0.0;
+    void *pval = NULL;
+
+    if (owner_att &&
+        MEnt_Get_AttVal(mr,owner_att,&owner_key,&rval,&pval) &&
+        owner_key > 0)
+      return owner_key;
+
+    return MR_GlobalID(mr);
+  }
+
   static int exo_export_read_sparse_sideset_metadata(
       Mesh_ptr mesh, const char *filename, int meshdim,
       int *num_side_set_glob, MSet_ptr **side_sets_glob,
@@ -1512,13 +1533,16 @@ extern "C" {
         int *send_displs = NULL, *recv_displs_int = NULL;
         int *send_pos = NULL, *sendbuf = NULL, *recvbuf = NULL;
         int total_recv_gid = 0, total_send_int = 0, total_recv_int = 0;
+        MAttrib_ptr sparse_owner_att = exo_export_sparse_owner_attr(mesh);
 
         idx = 0;
         while ((mr = MESH_Next_Region(mesh,&idx))) {
+          int owner_key;
           if (MR_PType(mr) == PGHOST) continue;
           local_owned++;
-          if (MR_GlobalID(mr) > local_max_gid)
-            local_max_gid = MR_GlobalID(mr);
+          owner_key = exo_export_region_owner_key(mr,sparse_owner_att);
+          if (owner_key > local_max_gid)
+            local_max_gid = owner_key;
         }
 
         local_gids = local_owned ?
@@ -1531,7 +1555,8 @@ extern "C" {
         idx = 0; j = 0;
         while ((mr = MESH_Next_Region(mesh,&idx))) {
           if (MR_PType(mr) == PGHOST) continue;
-          local_gids[j++] = MR_GlobalID(mr);
+          local_gids[j++] = exo_export_region_owner_key(mr,
+                                                        sparse_owner_att);
         }
 
         MPI_Allreduce(&local_max_gid,&global_max_gid,1,MPI_INT,MPI_MAX,comm);
@@ -1548,8 +1573,9 @@ extern "C" {
         while ((mr = MESH_Next_Region(mesh,&idx))) {
           int gid;
           if (MR_PType(mr) == PGHOST) continue;
-          gid = MR_GlobalID(mr);
-          owner_local_elem[gid] = elem_id[MR_ID(mr)-1];
+          gid = exo_export_region_owner_key(mr,sparse_owner_att);
+          if (gid > 0 && gid <= global_max_gid)
+            owner_local_elem[gid] = elem_id[MR_ID(mr)-1];
         }
 
         recv_counts = (int *) calloc(numprocs,sizeof(int));
