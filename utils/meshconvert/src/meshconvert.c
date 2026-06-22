@@ -122,12 +122,13 @@ int main(int argc, char *argv[]) {
   int experimental_sparse_set_copy=0;
   int experimental_batched_set_copy=0;
   int experimental_preserve_named_sidesets=0;
+  int experimental_sparse_sideset_export=0;
   MshFmt inmeshfmt, outmeshfmt;
   FILE *fp;
 
   if (argc < 3) {
     fprintf(stderr,"\n");
-    fprintf(stderr,"usage: meshconvert <--timing> <--experimental-skip-side-set-attrs> <--experimental-sparse-set-copy> <--experimental-batched-set-copy> <--experimental-preserve-named-sidesets> <--classify=0|n|1|y|2> <--partition=y|1|n|0> <--partition-method=0|1|2> <--parallel-check=y|1|n|0> <--weave=y|1|n|0> <--num-ghost-layers=?> <--check-topo=y|1|n|0> infilename outfilename\n\n");
+    fprintf(stderr,"usage: meshconvert <--timing> <--experimental-skip-side-set-attrs> <--experimental-sparse-set-copy> <--experimental-batched-set-copy> <--experimental-preserve-named-sidesets> <--experimental-sparse-sideset-export> <--classify=0|n|1|y|2> <--partition=y|1|n|0> <--partition-method=0|1|2> <--parallel-check=y|1|n|0> <--weave=y|1|n|0> <--num-ghost-layers=?> <--check-topo=y|1|n|0> infilename outfilename\n\n");
     fprintf(stderr,"partition-method = 0, METIS\n");
     fprintf(stderr,"                 = 1, ZOLTAN with GRAPH partioning\n");
     fprintf(stderr,"                 = 2, ZOLTAN with RCB partitioning\n");
@@ -198,6 +199,11 @@ int main(int argc, char *argv[]) {
       else if (strncmp(argv[i],"--experimental-preserve-named-sidesets",38) == 0) {
         experimental_preserve_named_sidesets = 1;
         setenv("MSTK_PRESERVE_NAMED_SIDESETS", "1", 1);
+      }
+      else if (strncmp(argv[i],"--experimental-sparse-sideset-export",37) == 0) {
+        experimental_sparse_sideset_export = 1;
+        setenv("MSTK_SPARSE_SIDESET_EXPORT", "1", 1);
+        setenv("MSTK_SKIP_SIDE_SET_ATTR_COPY", "1", 1);
       }
       else if (strncmp(argv[i],"--classify",10) == 0) {
         if (strncmp(argv[i]+11,"y",1) == 0 ||
@@ -358,7 +364,13 @@ int main(int argc, char *argv[]) {
     if (experimental_preserve_named_sidesets)
       fprintf(stderr,
               "[meshconvert][timing] experimental-preserve-named-sidesets enabled\n");
+    if (experimental_sparse_sideset_export)
+      fprintf(stderr,
+              "[meshconvert][timing] experimental-sparse-sideset-export enabled\n");
   }
+
+  if (experimental_sparse_sideset_export && inmeshfmt == EXODUSII)
+    setenv("MSTK_SPARSE_SIDESET_EXPORT_FILE", infname, 1);
 
   /* now read the mesh */
 

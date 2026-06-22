@@ -40,10 +40,15 @@ extern "C" {
     return (val && val[0] != '\0' && val[0] != '0');
   }
 
+  static int partition_send_sparse_sideset_export(void) {
+    const char *val = getenv("MSTK_SPARSE_SIDESET_EXPORT");
+    return (val && val[0] != '\0' && val[0] != '0');
+  }
+
   static int MESH_CopySets_Batched(Mesh_ptr parentmesh, int num,
                                    Mesh_ptr *submeshes, int nset_global,
-                                   char (*msetnames)[256], int timing,
-                                   int rank) {
+                                   int *msetids, char (*msetnames)[256],
+                                   int timing, int rank) {
     MAttrib_ptr g2latt = MESH_AttribByName(parentmesh,"Global2Local");
     if (!g2latt)
       MSTK_Report("MESH_CopySets_Batched",
@@ -60,7 +65,7 @@ extern "C" {
     double t0 = MPI_Wtime();
 
     for (int m = 0; m < nset_global; m++) {
-      MSet_ptr gmset = MESH_MSet(parentmesh,m);
+      MSet_ptr gmset = MESH_MSet(parentmesh,msetids[m]);
       MType mtype = MSet_EntDim(gmset);
       MEntity_ptr gment, lment;
       int idx = 0;
@@ -145,6 +150,7 @@ extern "C" {
     int timing = partition_send_timing_enabled();
     int skip_side_set_attrs = partition_send_skip_side_set_attr_copy();
     int batched_set_copy = partition_send_batched_set_copy();
+    int sparse_sideset_export = partition_send_sparse_sideset_export();
     double t0, t1;
     int skipped_side_set_attrs = 0;
 
@@ -337,7 +343,8 @@ extern "C" {
         if (atttype == POINTER) continue;
         if (skip_side_set_attrs && atttype == INT &&
             MAttrib_Get_EntDim(attrib) == side_dim &&
-            strncmp(attnames[a],"sideset_",8) != 0) {
+            (sparse_sideset_export ||
+             strncmp(attnames[a],"sideset_",8) != 0)) {
           skipped_side_set_attrs++;
           continue;
         }
@@ -419,29 +426,39 @@ extern "C" {
         
       /* First collect the mesh set information and copy into submeshes */
 
-      int nset_global = MESH_Num_MSets(parentmesh);
+      int nset_total = MESH_Num_MSets(parentmesh);
+      int nset_global = 0;
       char (*msetnames)[256] = 
-        (char (*)[256]) malloc(nset_global*sizeof(char [256]));
+        (char (*)[256]) malloc(nset_total*sizeof(char [256]));
+      int *msetids = (int *) malloc(nset_total*sizeof(int));
 
       t0 = MPI_Wtime();
-      for (m = 0; m < nset_global; m++) {
+      for (m = 0; m < nset_total; m++) {
         mset = MESH_MSet(parentmesh,m);
-        MSet_Name(mset,msetnames[m]);
+        if (sparse_sideset_export && MSet_EntDim(mset) == side_dim)
+          continue;
+        MSet_Name(mset,msetnames[nset_global]);
+        msetids[nset_global] = m;
+        nset_global++;
       }
       if (batched_set_copy)
         MESH_CopySets_Batched(parentmesh, num, submeshes, nset_global,
-                              msetnames, timing, rank);
+                              msetids, msetnames, timing, rank);
       else
-        for (m = 0; m < nset_global; m++) {
+        for (m = 0; m < nset_total; m++) {
           mset = MESH_MSet(parentmesh,m);
+          if (sparse_sideset_export && MSet_EntDim(mset) == side_dim)
+            continue;
           MESH_CopySet(parentmesh,num,submeshes,mset);
         }
       t1 = MPI_Wtime();
       if (timing)
         fprintf(stderr,
-                "[meshconvert][timing] %-36s %10.3f s sets=%d mode=%s\n",
+                "[meshconvert][timing] %-36s %10.3f s sets=%d/%d mode=%s\n",
                 "rank0 copy mesh sets", t1 - t0, nset_global,
-                batched_set_copy ? "batched" : "per-set");
+                nset_total,
+        batched_set_copy ? "batched" : "per-set");
+      free(msetids);
         
       /* Send Mesh Set Meta Data */
 
@@ -525,6 +542,7 @@ extern "C" {
       t1 = MPI_Wtime();
       if (timing)
         partition_send_print_time("rank0 send mesh sets", t0, t1, rank);
+      free(msetnames);
     }
 
 

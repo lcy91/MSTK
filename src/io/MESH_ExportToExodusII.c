@@ -318,6 +318,92 @@ extern "C" {
     list->n = nuniq;
   }
 
+  static const char *exo_export_sparse_sideset_file(void) {
+    const char *enabled = getenv("MSTK_SPARSE_SIDESET_EXPORT");
+    const char *filename = getenv("MSTK_SPARSE_SIDESET_EXPORT_FILE");
+    if (!enabled || enabled[0] == '\0' || enabled[0] == '0')
+      return NULL;
+    if (!filename || filename[0] == '\0')
+      return NULL;
+    return filename;
+  }
+
+  static int exo_export_read_sparse_sideset_metadata(
+      Mesh_ptr mesh, const char *filename, int meshdim,
+      int *num_side_set_glob, MSet_ptr **side_sets_glob,
+      int **side_set_ids_glob, char ***side_set_names_glob) {
+    int exoid, cpu_ws, io_ws, status, i;
+    float version;
+    ex_init_params exopar;
+    MType side_dim = (meshdim == 3) ? MFACE : MEDGE;
+
+    if (!mesh || !filename || !num_side_set_glob || !side_sets_glob ||
+        !side_set_ids_glob || !side_set_names_glob)
+      return 0;
+
+    cpu_ws = sizeof(double);
+    io_ws = sizeof(double);
+    exoid = ex_open(filename, EX_READ, &cpu_ws, &io_ws, &version);
+    if (exoid < 0)
+      MSTK_Report("MESH_ExportToExodusII",
+                  "Could not open input Exodus file for sparse side sets",
+                  MSTK_FATAL);
+
+    memset(&exopar,0,sizeof(ex_init_params));
+    status = ex_get_init_ext(exoid,&exopar);
+    if (status < 0)
+      MSTK_Report("MESH_ExportToExodusII",
+                  "Could not read input Exodus metadata for sparse side sets",
+                  MSTK_FATAL);
+
+    *num_side_set_glob = exopar.num_side_sets;
+    if (!exopar.num_side_sets) {
+      *side_sets_glob = NULL;
+      *side_set_ids_glob = NULL;
+      *side_set_names_glob = NULL;
+      ex_close(exoid);
+      return 1;
+    }
+
+    *side_set_ids_glob = (int *) malloc(exopar.num_side_sets*sizeof(int));
+    *side_sets_glob =
+      (MSet_ptr *) calloc(exopar.num_side_sets,sizeof(MSet_ptr));
+    *side_set_names_glob =
+      (char **) calloc(exopar.num_side_sets,sizeof(char *));
+    if (!*side_set_ids_glob || !*side_sets_glob || !*side_set_names_glob)
+      MSTK_Report("MESH_ExportToExodusII",
+                  "Could not allocate sparse side-set metadata",
+                  MSTK_FATAL);
+
+    status = ex_get_ids(exoid, EX_SIDE_SET, *side_set_ids_glob);
+    if (status < 0)
+      MSTK_Report("MESH_ExportToExodusII",
+                  "Could not read side-set IDs from input Exodus file",
+                  MSTK_FATAL);
+
+    for (i = 0; i < exopar.num_side_sets; i++) {
+      char sidesetname[256], tmpname[256];
+      sidesetname[0] = '\0';
+      status = ex_get_name(exoid, EX_SIDE_SET, (*side_set_ids_glob)[i],
+                           sidesetname);
+      if (status != 0 || sidesetname[0] == '\0')
+        sprintf(sidesetname,"sideset_%-d",(*side_set_ids_glob)[i]);
+
+      (*side_set_names_glob)[i] = (char *) calloc(256,sizeof(char));
+      if (!(*side_set_names_glob)[i])
+        MSTK_Report("MESH_ExportToExodusII",
+                    "Could not allocate sparse side-set name",
+                    MSTK_FATAL);
+      exo_export_copy_name((*side_set_names_glob)[i],sidesetname,256);
+
+      sprintf(tmpname,"TEMPORARY_sideset_%-d",(*side_set_ids_glob)[i]);
+      (*side_sets_glob)[i] = MSet_New(mesh,tmpname,side_dim);
+    }
+
+    ex_close(exoid);
+    return 1;
+  }
+
   static MRegion_ptr exo_export_matching_sideset_region(
       MFace_ptr mf, List_ptr fregs, const char *sideset_name,
       int num_element_set_glob, MSet_ptr *element_sets_glob,
@@ -931,10 +1017,19 @@ extern "C" {
 
     /* COLLECT SIDE SET INFO */
 
+    const char *sparse_sideset_file = exo_export_sparse_sideset_file();
     double collect_sideset_t0 = exo_export_wtime();
-    MESH_Get_Side_Set_Info(mesh, enable_geometry_sets,
-                           &num_side_set_glob, &side_sets_glob, 
-                           &side_set_ids_glob, &side_set_names_glob, comm);
+    if (sparse_sideset_file)
+      exo_export_read_sparse_sideset_metadata(mesh, sparse_sideset_file,
+                                              element_dim,
+                                              &num_side_set_glob,
+                                              &side_sets_glob,
+                                              &side_set_ids_glob,
+                                              &side_set_names_glob);
+    else
+      MESH_Get_Side_Set_Info(mesh, enable_geometry_sets,
+                             &num_side_set_glob, &side_sets_glob, 
+                             &side_set_ids_glob, &side_set_names_glob, comm);
     double collect_sideset_t1 = exo_export_wtime();
     if (timing)
       exo_export_print_time("export collect side-set info",
@@ -1399,7 +1494,11 @@ extern "C" {
                     MSTK_FATAL);
 
       for (i = 0; i < num_side_set_glob; i++) {
-        if (exo_export_raw_sideset_has_attrs(mesh,side_sets_glob[i])) {
+        if (sparse_sideset_file) {
+          raw_side_set_flags[i] = 1;
+          raw_set_count++;
+        }
+        else if (exo_export_raw_sideset_has_attrs(mesh,side_sets_glob[i])) {
           raw_side_set_flags[i] = 1;
           raw_set_count++;
         }
@@ -1487,17 +1586,68 @@ extern "C" {
                       "Could not allocate raw side-set communication counts",
                       MSTK_FATAL);
 
-        for (i = 0; i < num_side_set_glob; i++) {
-          if (!raw_side_set_flags[i]) continue;
-          idx = 0;
-          while ((mf = MSet_Next_Entry(side_sets_glob[i],&idx))) {
-            int owner_gid, side_ordinal, dest;
-            if (!exo_export_raw_sideset_attrs(mesh,side_sets_glob[i],mf,
-                                              &owner_gid,&side_ordinal))
-              continue;
-            if (owner_gid > global_max_gid) continue;
-            dest = owner_rank[owner_gid];
-            if (dest >= 0) send_counts[dest] += 3;
+        if (sparse_sideset_file) {
+          if (rank == 0) {
+            int exoid2, cpu_ws2, io_ws2, status2;
+            float version2;
+            cpu_ws2 = sizeof(double);
+            io_ws2 = sizeof(double);
+            exoid2 = ex_open(sparse_sideset_file, EX_READ, &cpu_ws2,
+                             &io_ws2, &version2);
+            if (exoid2 < 0)
+              MSTK_Report("MESH_ExportToExodusII",
+                          "Could not open input Exodus side-set file",
+                          MSTK_FATAL);
+            for (i = 0; i < num_side_set_glob; i++) {
+              int num_sides_in_set = 0, num_df_in_set = 0;
+              int *ss_elem_list = NULL, *ss_side_list = NULL;
+              status2 = ex_get_set_param(exoid2, EX_SIDE_SET,
+                                          side_set_ids_glob[i],
+                                          &num_sides_in_set,
+                                          &num_df_in_set);
+              if (status2 < 0)
+                MSTK_Report("MESH_ExportToExodusII",
+                            "Could not read sparse side-set size",
+                            MSTK_FATAL);
+              if (!num_sides_in_set) continue;
+              ss_elem_list = (int *) malloc(num_sides_in_set*sizeof(int));
+              ss_side_list = (int *) malloc(num_sides_in_set*sizeof(int));
+              if (!ss_elem_list || !ss_side_list)
+                MSTK_Report("MESH_ExportToExodusII",
+                            "Could not allocate sparse side-set read buffer",
+                            MSTK_FATAL);
+              status2 = ex_get_set(exoid2, EX_SIDE_SET, side_set_ids_glob[i],
+                                   ss_elem_list, ss_side_list);
+              if (status2 < 0)
+                MSTK_Report("MESH_ExportToExodusII",
+                            "Could not read sparse side-set entries",
+                            MSTK_FATAL);
+              for (j = 0; j < num_sides_in_set; j++) {
+                int owner_gid = ss_elem_list[j];
+                int dest;
+                if (owner_gid <= 0 || owner_gid > global_max_gid) continue;
+                dest = owner_rank[owner_gid];
+                if (dest >= 0) send_counts[dest] += 3;
+              }
+              free(ss_elem_list);
+              free(ss_side_list);
+            }
+            ex_close(exoid2);
+          }
+        }
+        else {
+          for (i = 0; i < num_side_set_glob; i++) {
+            if (!raw_side_set_flags[i]) continue;
+            idx = 0;
+            while ((mf = MSet_Next_Entry(side_sets_glob[i],&idx))) {
+              int owner_gid, side_ordinal, dest;
+              if (!exo_export_raw_sideset_attrs(mesh,side_sets_glob[i],mf,
+                                                &owner_gid,&side_ordinal))
+                continue;
+              if (owner_gid > global_max_gid) continue;
+              dest = owner_rank[owner_gid];
+              if (dest >= 0) send_counts[dest] += 3;
+            }
           }
         }
 
@@ -1523,22 +1673,79 @@ extern "C" {
                       "Could not allocate raw side-set communication buffers",
                       MSTK_FATAL);
 
-        for (i = 0; i < num_side_set_glob; i++) {
-          if (!raw_side_set_flags[i]) continue;
-          idx = 0;
-          while ((mf = MSet_Next_Entry(side_sets_glob[i],&idx))) {
-            int owner_gid, side_ordinal, dest, pos;
-            if (!exo_export_raw_sideset_attrs(mesh,side_sets_glob[i],mf,
-                                              &owner_gid,&side_ordinal))
-              continue;
-            if (owner_gid > global_max_gid) continue;
-            dest = owner_rank[owner_gid];
-            if (dest < 0) continue;
-            pos = send_pos[dest];
-            sendbuf[pos] = i;
-            sendbuf[pos+1] = owner_gid;
-            sendbuf[pos+2] = side_ordinal;
-            send_pos[dest] += 3;
+        if (sparse_sideset_file) {
+          if (rank == 0) {
+            int exoid2, cpu_ws2, io_ws2, status2;
+            float version2;
+            cpu_ws2 = sizeof(double);
+            io_ws2 = sizeof(double);
+            exoid2 = ex_open(sparse_sideset_file, EX_READ, &cpu_ws2,
+                             &io_ws2, &version2);
+            if (exoid2 < 0)
+              MSTK_Report("MESH_ExportToExodusII",
+                          "Could not open input Exodus side-set file",
+                          MSTK_FATAL);
+            for (i = 0; i < num_side_set_glob; i++) {
+              int num_sides_in_set = 0, num_df_in_set = 0;
+              int *ss_elem_list = NULL, *ss_side_list = NULL;
+              status2 = ex_get_set_param(exoid2, EX_SIDE_SET,
+                                          side_set_ids_glob[i],
+                                          &num_sides_in_set,
+                                          &num_df_in_set);
+              if (status2 < 0)
+                MSTK_Report("MESH_ExportToExodusII",
+                            "Could not read sparse side-set size",
+                            MSTK_FATAL);
+              if (!num_sides_in_set) continue;
+              ss_elem_list = (int *) malloc(num_sides_in_set*sizeof(int));
+              ss_side_list = (int *) malloc(num_sides_in_set*sizeof(int));
+              if (!ss_elem_list || !ss_side_list)
+                MSTK_Report("MESH_ExportToExodusII",
+                            "Could not allocate sparse side-set read buffer",
+                            MSTK_FATAL);
+              status2 = ex_get_set(exoid2, EX_SIDE_SET, side_set_ids_glob[i],
+                                   ss_elem_list, ss_side_list);
+              if (status2 < 0)
+                MSTK_Report("MESH_ExportToExodusII",
+                            "Could not read sparse side-set entries",
+                            MSTK_FATAL);
+              for (j = 0; j < num_sides_in_set; j++) {
+                int owner_gid = ss_elem_list[j];
+                int side_ordinal = ss_side_list[j];
+                int dest, pos;
+                if (owner_gid <= 0 || owner_gid > global_max_gid) continue;
+                dest = owner_rank[owner_gid];
+                if (dest < 0) continue;
+                pos = send_pos[dest];
+                sendbuf[pos] = i;
+                sendbuf[pos+1] = owner_gid;
+                sendbuf[pos+2] = side_ordinal;
+                send_pos[dest] += 3;
+              }
+              free(ss_elem_list);
+              free(ss_side_list);
+            }
+            ex_close(exoid2);
+          }
+        }
+        else {
+          for (i = 0; i < num_side_set_glob; i++) {
+            if (!raw_side_set_flags[i]) continue;
+            idx = 0;
+            while ((mf = MSet_Next_Entry(side_sets_glob[i],&idx))) {
+              int owner_gid, side_ordinal, dest, pos;
+              if (!exo_export_raw_sideset_attrs(mesh,side_sets_glob[i],mf,
+                                                &owner_gid,&side_ordinal))
+                continue;
+              if (owner_gid > global_max_gid) continue;
+              dest = owner_rank[owner_gid];
+              if (dest < 0) continue;
+              pos = send_pos[dest];
+              sendbuf[pos] = i;
+              sendbuf[pos+1] = owner_gid;
+              sendbuf[pos+2] = side_ordinal;
+              send_pos[dest] += 3;
+            }
           }
         }
 
