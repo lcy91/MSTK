@@ -1529,6 +1529,7 @@ extern "C" {
         int local_owned = 0, local_max_gid = 0, global_max_gid = 0;
         int *local_gids = NULL, *recv_counts = NULL, *recv_displs = NULL;
         int *all_gids = NULL, *owner_rank = NULL, *owner_local_elem = NULL;
+        MRegion_ptr *owner_region = NULL;
         int *send_counts = NULL, *recv_counts_int = NULL;
         int *send_displs = NULL, *recv_displs_int = NULL;
         int *send_pos = NULL, *sendbuf = NULL, *recvbuf = NULL;
@@ -1562,7 +1563,9 @@ extern "C" {
         MPI_Allreduce(&local_max_gid,&global_max_gid,1,MPI_INT,MPI_MAX,comm);
         owner_rank = (int *) malloc((global_max_gid+1)*sizeof(int));
         owner_local_elem = (int *) calloc(global_max_gid+1,sizeof(int));
-        if (!owner_rank || !owner_local_elem)
+        owner_region = (MRegion_ptr *) calloc(global_max_gid+1,
+                                              sizeof(MRegion_ptr));
+        if (!owner_rank || !owner_local_elem || !owner_region)
           MSTK_Report("MESH_ExportToExodusII",
                       "Could not allocate element owner map",
                       MSTK_FATAL);
@@ -1574,8 +1577,10 @@ extern "C" {
           int gid;
           if (MR_PType(mr) == PGHOST) continue;
           gid = exo_export_region_owner_key(mr,sparse_owner_att);
-          if (gid > 0 && gid <= global_max_gid)
+          if (gid > 0 && gid <= global_max_gid) {
             owner_local_elem[gid] = elem_id[MR_ID(mr)-1];
+            owner_region[gid] = mr;
+          }
         }
 
         recv_counts = (int *) calloc(numprocs,sizeof(int));
@@ -1784,9 +1789,18 @@ extern "C" {
           int side_ordinal = recvbuf[i+2];
           int local_elem = 0;
           if (set_index < 0 || set_index >= num_side_set_glob) continue;
-          if (owner_gid > 0 && owner_gid <= global_max_gid)
+          if (owner_gid > 0 && owner_gid <= global_max_gid) {
             local_elem = owner_local_elem[owner_gid];
+            mr = owner_region[owner_gid];
+          }
           if (local_elem <= 0) continue;
+          if (sparse_sideset_file && mr) {
+            MRType mrtype;
+            MEnt_Get_AttVal(mr,block_type_att,&mrtype,NULL,NULL);
+            if ((mrtype == TET || mrtype == PRISM || mrtype == HEX) &&
+                side_ordinal > 0 && side_ordinal <= 6)
+              side_ordinal = mstk2exo_facemap[mrtype][side_ordinal-1];
+          }
           exo_export_raw_list_add(&raw_side_lists[set_index],local_elem,
                                   side_ordinal);
         }
@@ -1801,6 +1815,7 @@ extern "C" {
         free(all_gids);
         free(owner_rank);
         free(owner_local_elem);
+        free(owner_region);
         free(send_counts);
         free(recv_counts_int);
         free(send_displs);
