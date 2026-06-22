@@ -98,6 +98,226 @@ extern "C" {
     return 1;
   }
 
+  static int exo_export_sideset_id_from_mset(Mesh_ptr mesh, MSet_ptr mset,
+                                             char *mset_name, int *sid) {
+    MAttrib_ptr attrib;
+    MEntity_ptr ment;
+    int ival;
+    double rval;
+    void *pval;
+
+    if (!mset || !mset_name || !sid) return 0;
+
+    if (strncmp(mset_name,"sideset_",8) == 0) {
+      if (sscanf(mset_name+8,"%d",sid) == 1) return 1;
+      return 0;
+    }
+
+    attrib = MESH_AttribByName(mesh,mset_name);
+    if (!attrib || MAttrib_Get_Type(attrib) != INT) return 0;
+    if (MAttrib_Get_EntDim(attrib) != MSet_EntDim(mset)) return 0;
+    if (MSet_Num_Entries(mset) == 0) return 0;
+
+    ment = MSet_Entry(mset,0);
+    if (!ment) return 0;
+    if (!MEnt_Get_AttVal(ment,attrib,&ival,&rval,&pval)) return 0;
+    if (ival <= 0) return 0;
+
+    *sid = ival;
+    return 1;
+  }
+
+  static MRegion_ptr exo_export_sideset_owner_region(
+      Mesh_ptr mesh, MSet_ptr side_set, MFace_ptr mf, List_ptr fregs) {
+    char msetname[256];
+    MAttrib_ptr owner_att;
+    int owner_gid, i, nfregs;
+    double rval;
+    void *pval;
+
+    if (!mesh || !side_set || !mf || !fregs) return NULL;
+    MSet_Name(side_set,msetname);
+    if (strncmp(msetname,"sideset_",8) != 0) return NULL;
+
+    owner_att = MESH_AttribByName(mesh,msetname);
+    if (!owner_att || MAttrib_Get_Type(owner_att) != INT ||
+        MAttrib_Get_EntDim(owner_att) != MFACE)
+      return NULL;
+    if (!MEnt_Get_AttVal(mf,owner_att,&owner_gid,&rval,&pval))
+      return NULL;
+    if (owner_gid <= 0) return NULL;
+
+    nfregs = List_Num_Entries(fregs);
+    for (i = 0; i < nfregs; i++) {
+      MRegion_ptr cand = List_Entry(fregs,i);
+      if (cand && MR_GlobalID(cand) == owner_gid)
+        return cand;
+    }
+
+    return NULL;
+  }
+
+  static int exo_export_local_elem_id_from_global(Mesh_ptr mesh, int *elem_id,
+                                                  int owner_gid) {
+    int idx = 0;
+    MRegion_ptr cand;
+
+    if (!mesh || !elem_id || owner_gid <= 0) return 0;
+    while ((cand = MESH_Next_Region(mesh,&idx))) {
+#ifdef MSTK_HAVE_MPI
+      if (MR_PType(cand) == PGHOST) continue;
+#endif
+      if (MR_GlobalID(cand) == owner_gid)
+        return elem_id[MR_ID(cand)-1];
+    }
+    return 0;
+  }
+
+  static int exo_export_raw_sideset_entry(Mesh_ptr mesh, MSet_ptr side_set,
+                                          MFace_ptr mf, int *elem_id,
+                                          int *out_elem, int *out_side) {
+    char msetname[256], sideattname[256];
+    MAttrib_ptr owner_att, side_att;
+    int owner_gid, side_ordinal, local_elem_id;
+    double rval;
+    void *pval;
+
+    if (!mesh || !side_set || !mf || !elem_id || !out_elem || !out_side)
+      return 0;
+    MSet_Name(side_set,msetname);
+    if (strncmp(msetname,"sideset_",8) != 0) return 0;
+
+    snprintf(sideattname,sizeof(sideattname),"%s__side",msetname);
+    owner_att = MESH_AttribByName(mesh,msetname);
+    side_att = MESH_AttribByName(mesh,sideattname);
+    if (!owner_att || !side_att) return 0;
+    if (MAttrib_Get_Type(owner_att) != INT ||
+        MAttrib_Get_Type(side_att) != INT ||
+        MAttrib_Get_EntDim(owner_att) != MFACE ||
+        MAttrib_Get_EntDim(side_att) != MFACE)
+      return 0;
+    if (!MEnt_Get_AttVal(mf,owner_att,&owner_gid,&rval,&pval))
+      return 0;
+    if (!MEnt_Get_AttVal(mf,side_att,&side_ordinal,&rval,&pval))
+      return 0;
+
+    local_elem_id = exo_export_local_elem_id_from_global(mesh,elem_id,owner_gid);
+    if (local_elem_id <= 0) return -1;
+
+    *out_elem = local_elem_id;
+    *out_side = side_ordinal;
+    return 1;
+  }
+
+  typedef struct {
+    int set_index;
+    int owner_gid;
+    int side_ordinal;
+  } ExoRawSideSend;
+
+  typedef struct {
+    int elem;
+    int side;
+  } ExoRawSidePair;
+
+  typedef struct {
+    int n;
+    int alloc;
+    ExoRawSidePair *pairs;
+  } ExoRawSideList;
+
+  static int exo_export_raw_sideset_attrs(Mesh_ptr mesh, MSet_ptr side_set,
+                                          MFace_ptr mf, int *owner_gid,
+                                          int *side_ordinal) {
+    char msetname[256], sideattname[256];
+    MAttrib_ptr owner_att, side_att;
+    double rval;
+    void *pval;
+
+    if (!mesh || !side_set || !mf || !owner_gid || !side_ordinal)
+      return 0;
+    MSet_Name(side_set,msetname);
+    if (strncmp(msetname,"sideset_",8) != 0) return 0;
+
+    snprintf(sideattname,sizeof(sideattname),"%s__side",msetname);
+    owner_att = MESH_AttribByName(mesh,msetname);
+    side_att = MESH_AttribByName(mesh,sideattname);
+    if (!owner_att || !side_att) return 0;
+    if (MAttrib_Get_Type(owner_att) != INT ||
+        MAttrib_Get_Type(side_att) != INT ||
+        MAttrib_Get_EntDim(owner_att) != MFACE ||
+        MAttrib_Get_EntDim(side_att) != MFACE)
+      return 0;
+    if (!MEnt_Get_AttVal(mf,owner_att,owner_gid,&rval,&pval))
+      return 0;
+    if (!MEnt_Get_AttVal(mf,side_att,side_ordinal,&rval,&pval))
+      return 0;
+    if (*owner_gid <= 0 || *side_ordinal <= 0) return 0;
+    return 1;
+  }
+
+  static int exo_export_raw_sideset_has_attrs(Mesh_ptr mesh,
+                                              MSet_ptr side_set) {
+    char msetname[256], sideattname[256];
+    MAttrib_ptr owner_att, side_att;
+
+    if (!mesh || !side_set) return 0;
+    MSet_Name(side_set,msetname);
+    if (strncmp(msetname,"sideset_",8) != 0) return 0;
+    snprintf(sideattname,sizeof(sideattname),"%s__side",msetname);
+    owner_att = MESH_AttribByName(mesh,msetname);
+    side_att = MESH_AttribByName(mesh,sideattname);
+    return owner_att && side_att &&
+      MAttrib_Get_Type(owner_att) == INT &&
+      MAttrib_Get_Type(side_att) == INT &&
+      MAttrib_Get_EntDim(owner_att) == MFACE &&
+      MAttrib_Get_EntDim(side_att) == MFACE;
+  }
+
+  static void exo_export_raw_list_add(ExoRawSideList *list, int elem,
+                                      int side) {
+    if (!list) return;
+    if (list->n == list->alloc) {
+      list->alloc = list->alloc ? 2*list->alloc : 64;
+      list->pairs = (ExoRawSidePair *) realloc(list->pairs,
+                                               list->alloc*
+                                               sizeof(ExoRawSidePair));
+      if (!list->pairs)
+        MSTK_Report("MESH_ExportToExodusII",
+                    "Could not allocate raw side-set export list",
+                    MSTK_FATAL);
+    }
+    list->pairs[list->n].elem = elem;
+    list->pairs[list->n].side = side;
+    list->n++;
+  }
+
+  static int exo_export_raw_pair_cmp(const void *a, const void *b) {
+    const ExoRawSidePair *pa = (const ExoRawSidePair *) a;
+    const ExoRawSidePair *pb = (const ExoRawSidePair *) b;
+    if (pa->elem < pb->elem) return -1;
+    if (pa->elem > pb->elem) return 1;
+    if (pa->side < pb->side) return -1;
+    if (pa->side > pb->side) return 1;
+    return 0;
+  }
+
+  static void exo_export_raw_list_unique(ExoRawSideList *list) {
+    int i, nuniq;
+
+    if (!list || list->n < 2) return;
+    qsort(list->pairs,list->n,sizeof(ExoRawSidePair),
+          exo_export_raw_pair_cmp);
+    nuniq = 1;
+    for (i = 1; i < list->n; i++) {
+      if (list->pairs[i].elem == list->pairs[nuniq-1].elem &&
+          list->pairs[i].side == list->pairs[nuniq-1].side)
+        continue;
+      list->pairs[nuniq++] = list->pairs[i];
+    }
+    list->n = nuniq;
+  }
+
   static MRegion_ptr exo_export_matching_sideset_region(
       MFace_ptr mf, List_ptr fregs, const char *sideset_name,
       int num_element_set_glob, MSet_ptr *element_sets_glob,
@@ -1163,6 +1383,202 @@ extern "C" {
 
     double write_sideset_t0 = exo_export_wtime();
     long long local_export_sideset_entries = 0;
+    int *raw_side_set_flags = NULL;
+    ExoRawSideList *raw_side_lists = NULL;
+
+#ifdef MSTK_HAVE_MPI
+    if (comm && nrowned && num_side_set_glob) {
+      int raw_set_count = 0;
+
+      raw_side_set_flags = (int *) calloc(num_side_set_glob,sizeof(int));
+      raw_side_lists = (ExoRawSideList *) calloc(num_side_set_glob,
+                                                 sizeof(ExoRawSideList));
+      if (!raw_side_set_flags || !raw_side_lists)
+        MSTK_Report("MESH_ExportToExodusII",
+                    "Could not allocate raw side-set export metadata",
+                    MSTK_FATAL);
+
+      for (i = 0; i < num_side_set_glob; i++) {
+        if (exo_export_raw_sideset_has_attrs(mesh,side_sets_glob[i])) {
+          raw_side_set_flags[i] = 1;
+          raw_set_count++;
+        }
+      }
+
+      if (raw_set_count) {
+        int local_owned = 0, local_max_gid = 0, global_max_gid = 0;
+        int *local_gids = NULL, *recv_counts = NULL, *recv_displs = NULL;
+        int *all_gids = NULL, *owner_rank = NULL, *owner_local_elem = NULL;
+        int *send_counts = NULL, *recv_counts_int = NULL;
+        int *send_displs = NULL, *recv_displs_int = NULL;
+        int *send_pos = NULL, *sendbuf = NULL, *recvbuf = NULL;
+        int total_recv_gid = 0, total_send_int = 0, total_recv_int = 0;
+
+        idx = 0;
+        while ((mr = MESH_Next_Region(mesh,&idx))) {
+          if (MR_PType(mr) == PGHOST) continue;
+          local_owned++;
+          if (MR_GlobalID(mr) > local_max_gid)
+            local_max_gid = MR_GlobalID(mr);
+        }
+
+        local_gids = local_owned ?
+          (int *) malloc(local_owned*sizeof(int)) : NULL;
+        if (local_owned && !local_gids)
+          MSTK_Report("MESH_ExportToExodusII",
+                      "Could not allocate local element id list",
+                      MSTK_FATAL);
+
+        idx = 0; j = 0;
+        while ((mr = MESH_Next_Region(mesh,&idx))) {
+          if (MR_PType(mr) == PGHOST) continue;
+          local_gids[j++] = MR_GlobalID(mr);
+        }
+
+        MPI_Allreduce(&local_max_gid,&global_max_gid,1,MPI_INT,MPI_MAX,comm);
+        owner_rank = (int *) malloc((global_max_gid+1)*sizeof(int));
+        owner_local_elem = (int *) calloc(global_max_gid+1,sizeof(int));
+        if (!owner_rank || !owner_local_elem)
+          MSTK_Report("MESH_ExportToExodusII",
+                      "Could not allocate element owner map",
+                      MSTK_FATAL);
+        for (i = 0; i <= global_max_gid; i++)
+          owner_rank[i] = -1;
+
+        idx = 0;
+        while ((mr = MESH_Next_Region(mesh,&idx))) {
+          int gid;
+          if (MR_PType(mr) == PGHOST) continue;
+          gid = MR_GlobalID(mr);
+          owner_local_elem[gid] = elem_id[MR_ID(mr)-1];
+        }
+
+        recv_counts = (int *) calloc(numprocs,sizeof(int));
+        recv_displs = (int *) calloc(numprocs,sizeof(int));
+        if (!recv_counts || !recv_displs)
+          MSTK_Report("MESH_ExportToExodusII",
+                      "Could not allocate element owner gather counts",
+                      MSTK_FATAL);
+        MPI_Allgather(&local_owned,1,MPI_INT,recv_counts,1,MPI_INT,comm);
+        for (i = 0; i < numprocs; i++) {
+          recv_displs[i] = total_recv_gid;
+          total_recv_gid += recv_counts[i];
+        }
+        all_gids = total_recv_gid ?
+          (int *) malloc(total_recv_gid*sizeof(int)) : NULL;
+        if (total_recv_gid && !all_gids)
+          MSTK_Report("MESH_ExportToExodusII",
+                      "Could not allocate element owner gather buffer",
+                      MSTK_FATAL);
+        MPI_Allgatherv(local_gids,local_owned,MPI_INT,
+                       all_gids,recv_counts,recv_displs,MPI_INT,comm);
+        for (i = 0; i < numprocs; i++) {
+          for (j = 0; j < recv_counts[i]; j++) {
+            int gid = all_gids[recv_displs[i]+j];
+            if (gid > 0 && gid <= global_max_gid)
+              owner_rank[gid] = i;
+          }
+        }
+
+        send_counts = (int *) calloc(numprocs,sizeof(int));
+        recv_counts_int = (int *) calloc(numprocs,sizeof(int));
+        if (!send_counts || !recv_counts_int)
+          MSTK_Report("MESH_ExportToExodusII",
+                      "Could not allocate raw side-set communication counts",
+                      MSTK_FATAL);
+
+        for (i = 0; i < num_side_set_glob; i++) {
+          if (!raw_side_set_flags[i]) continue;
+          idx = 0;
+          while ((mf = MSet_Next_Entry(side_sets_glob[i],&idx))) {
+            int owner_gid, side_ordinal, dest;
+            if (!exo_export_raw_sideset_attrs(mesh,side_sets_glob[i],mf,
+                                              &owner_gid,&side_ordinal))
+              continue;
+            if (owner_gid > global_max_gid) continue;
+            dest = owner_rank[owner_gid];
+            if (dest >= 0) send_counts[dest] += 3;
+          }
+        }
+
+        MPI_Alltoall(send_counts,1,MPI_INT,recv_counts_int,1,MPI_INT,comm);
+        send_displs = (int *) calloc(numprocs,sizeof(int));
+        recv_displs_int = (int *) calloc(numprocs,sizeof(int));
+        send_pos = (int *) calloc(numprocs,sizeof(int));
+        if (!send_displs || !recv_displs_int || !send_pos)
+          MSTK_Report("MESH_ExportToExodusII",
+                      "Could not allocate raw side-set communication displs",
+                      MSTK_FATAL);
+        for (i = 0; i < numprocs; i++) {
+          send_displs[i] = total_send_int;
+          total_send_int += send_counts[i];
+          recv_displs_int[i] = total_recv_int;
+          total_recv_int += recv_counts_int[i];
+          send_pos[i] = send_displs[i];
+        }
+        sendbuf = total_send_int ? (int *) malloc(total_send_int*sizeof(int)) : NULL;
+        recvbuf = total_recv_int ? (int *) malloc(total_recv_int*sizeof(int)) : NULL;
+        if ((total_send_int && !sendbuf) || (total_recv_int && !recvbuf))
+          MSTK_Report("MESH_ExportToExodusII",
+                      "Could not allocate raw side-set communication buffers",
+                      MSTK_FATAL);
+
+        for (i = 0; i < num_side_set_glob; i++) {
+          if (!raw_side_set_flags[i]) continue;
+          idx = 0;
+          while ((mf = MSet_Next_Entry(side_sets_glob[i],&idx))) {
+            int owner_gid, side_ordinal, dest, pos;
+            if (!exo_export_raw_sideset_attrs(mesh,side_sets_glob[i],mf,
+                                              &owner_gid,&side_ordinal))
+              continue;
+            if (owner_gid > global_max_gid) continue;
+            dest = owner_rank[owner_gid];
+            if (dest < 0) continue;
+            pos = send_pos[dest];
+            sendbuf[pos] = i;
+            sendbuf[pos+1] = owner_gid;
+            sendbuf[pos+2] = side_ordinal;
+            send_pos[dest] += 3;
+          }
+        }
+
+        MPI_Alltoallv(sendbuf,send_counts,send_displs,MPI_INT,
+                      recvbuf,recv_counts_int,recv_displs_int,MPI_INT,comm);
+
+        for (i = 0; i < total_recv_int; i += 3) {
+          int set_index = recvbuf[i];
+          int owner_gid = recvbuf[i+1];
+          int side_ordinal = recvbuf[i+2];
+          int local_elem = 0;
+          if (set_index < 0 || set_index >= num_side_set_glob) continue;
+          if (owner_gid > 0 && owner_gid <= global_max_gid)
+            local_elem = owner_local_elem[owner_gid];
+          if (local_elem <= 0) continue;
+          exo_export_raw_list_add(&raw_side_lists[set_index],local_elem,
+                                  side_ordinal);
+        }
+
+        for (i = 0; i < num_side_set_glob; i++)
+          if (raw_side_set_flags[i])
+            exo_export_raw_list_unique(&raw_side_lists[i]);
+
+        free(local_gids);
+        free(recv_counts);
+        free(recv_displs);
+        free(all_gids);
+        free(owner_rank);
+        free(owner_local_elem);
+        free(send_counts);
+        free(recv_counts_int);
+        free(send_displs);
+        free(recv_displs_int);
+        free(send_pos);
+        free(sendbuf);
+        free(recvbuf);
+      }
+    }
+#endif
+
 #ifndef EXODUS_6_DEPRECATED
     ex_set_specs side_set_specs;
     int *concat_side_set_ids = NULL;
@@ -1178,7 +1594,9 @@ extern "C" {
 
     if (num_side_set_glob) {
       for (i = 0; i < num_side_set_glob; i++)
-        concat_side_set_max_entries += MSet_Num_Entries(side_sets_glob[i]);
+        concat_side_set_max_entries +=
+          (raw_side_set_flags && raw_side_set_flags[i]) ?
+          raw_side_lists[i].n : MSet_Num_Entries(side_sets_glob[i]);
 
       concat_side_set_ids =
         (int *) calloc(num_side_set_glob,sizeof(int));
@@ -1211,7 +1629,8 @@ extern "C" {
 
     for (i = 0; i < num_side_set_glob; i++) {
 
-      int maxsides = MSet_Num_Entries(side_sets_glob[i]);
+      int maxsides = (raw_side_set_flags && raw_side_set_flags[i]) ?
+        raw_side_lists[i].n : MSet_Num_Entries(side_sets_glob[i]);
 #ifdef EXODUS_6_DEPRECATED
       int *elem_list = (int *) malloc(maxsides*sizeof(int));
       int *side_list = (int *) malloc(maxsides*sizeof(int));
@@ -1233,9 +1652,28 @@ extern "C" {
                                 sizeof(sideset_output_name));
 
       int nsides = 0;
-      if (nrowned) {        
+      if (raw_side_set_flags && raw_side_set_flags[i]) {
+        for (j = 0; j < raw_side_lists[i].n; j++) {
+          elem_list[nsides] = raw_side_lists[i].pairs[j].elem;
+          side_list[nsides] = raw_side_lists[i].pairs[j].side;
+          nsides++;
+        }
+      }
+      else if (nrowned) {        
 	idx = 0;
 	while ((mf = MSet_Next_Entry(side_sets_glob[i],&idx))) {
+          int raw_status = exo_export_raw_sideset_entry(mesh, side_sets_glob[i],
+                                                        mf, elem_id,
+                                                        &elem_list[nsides],
+                                                        &side_list[nsides]);
+          if (raw_status == 1) {
+            nsides++;
+            continue;
+          }
+          else if (raw_status < 0) {
+            continue;
+          }
+
           if (MF_PType(mf) == PGHOST &&  !MF_OnParBoundary(mf)) continue;
 
 	  List_ptr fregs = MF_Regions(mf);
@@ -1244,22 +1682,28 @@ extern "C" {
 	    MSTK_Report("MESH_ExportToEXODUSII",
 			"Standalone face with no regions in side set",
 			MSTK_FATAL);
-	  mr = exo_export_matching_sideset_region(mf, fregs,
-                                                  sideset_output_name,
-                                                  num_element_set_glob,
-                                                  element_sets_glob,
-                                                  element_set_ids_glob);
+		  mr = exo_export_sideset_owner_region(mesh, side_sets_glob[i],
+                                                       mf, fregs);
+                  if (!mr)
+		    mr = exo_export_matching_sideset_region(mf, fregs,
+	                                                    sideset_output_name,
+	                                                    num_element_set_glob,
+	                                                    element_sets_glob,
+	                                                    element_set_ids_glob);
           if (!mr)
             mr = List_Entry(fregs,0);
 
 #ifdef MSTK_HAVE_MPI
           if (comm && MR_PType(mr) == PGHOST) {
-            MRegion_ptr owned_mr =
-              exo_export_matching_sideset_region(mf, fregs,
-                                                  sideset_output_name,
-                                                  num_element_set_glob,
-                                                  element_sets_glob,
-                                                  element_set_ids_glob);
+	            MRegion_ptr owned_mr =
+	              exo_export_sideset_owner_region(mesh, side_sets_glob[i],
+                                                       mf, fregs);
+                    if (!owned_mr)
+	              owned_mr = exo_export_matching_sideset_region(mf, fregs,
+	                                                    sideset_output_name,
+	                                                    num_element_set_glob,
+	                                                    element_sets_glob,
+	                                                    element_set_ids_glob);
             if (owned_mr && MR_PType(owned_mr) != PGHOST)
               mr = owned_mr;
             else if (List_Num_Entries(fregs) > 1)
@@ -1400,6 +1844,13 @@ extern "C" {
       free(side_set_output_names);
     }
 #endif
+    if (raw_side_lists) {
+      for (i = 0; i < num_side_set_glob; i++)
+        free(raw_side_lists[i].pairs);
+      free(raw_side_lists);
+    }
+    free(raw_side_set_flags);
+
     double write_sideset_t1 = exo_export_wtime();
     if (timing) {
       exo_export_print_time("export write side sets",
@@ -1609,31 +2060,25 @@ extern "C" {
       int *elem_map;
 
       if (nrowned) {
-        elem_map = (int *) malloc(nrowned*sizeof(int));
-        idx = 0; i = 0;
-        while ((mr = MESH_Next_Region(mesh,&idx))) {
-          int rowned;
-#ifdef MSTK_USE_MARKERS
-          rowned = MEnt_IsMarked(mr, ownedmk);
-#else
-          MEnt_Get_AttVal(mr, ownedatt, &rowned, &rval, &pval);
-#endif
-          if (rowned)
-            elem_map[i++] = MR_GlobalID(mr);
+        elem_map = (int *) calloc(nrowned,sizeof(int));
+        for (i = 0; i < num_element_block_glob; i++) {
+          idx = 0;
+          while ((mr = MSet_Next_Entry(element_blocks_glob[i],&idx))) {
+            int local_elem_id = elem_id[MR_ID(mr)-1];
+            if (local_elem_id > 0 && local_elem_id <= nrowned)
+              elem_map[local_elem_id-1] = MR_GlobalID(mr);
+          }
         }
       }
       else { // assume surface mesh
-        elem_map = (int *) malloc(nfowned*sizeof(int));
-        idx = 0; i = 0;
-        while ((mf = MESH_Next_Face(mesh,&idx))) {
-          int fowned;
-#ifdef MSTK_USE_MARKERS
-          fowned = MEnt_IsMarked(mf, ownedmk);
-#else
-          MEnt_Get_AttVal(mf, ownedatt, &fowned, &rval, &pval);
-#endif
-          if (fowned)
-            elem_map[i++] = MF_GlobalID(mf);
+        elem_map = (int *) calloc(nfowned,sizeof(int));
+        for (i = 0; i < num_element_block_glob; i++) {
+          idx = 0;
+          while ((mf = MSet_Next_Entry(element_blocks_glob[i],&idx))) {
+            int local_elem_id = elem_id[MF_ID(mf)-1];
+            if (local_elem_id > 0 && local_elem_id <= nfowned)
+              elem_map[local_elem_id-1] = MF_GlobalID(mf);
+          }
         }
       }
 #ifdef EXODUS_6_DEPRECATED
@@ -2560,9 +3005,8 @@ extern "C" {
         dim = MSet_EntDim(mset);
 
         if (dim != MFACE) continue; 
-        if (strncmp(mset_name,"sideset_",8) != 0) continue;
-
-        sscanf(mset_name+8,"%d",&sid);
+        if (!exo_export_sideset_id_from_mset(mesh,mset,mset_name,&sid))
+          continue;
 
         if (nsideset == nsalloc) {
           nsalloc *= 2;
@@ -2653,9 +3097,8 @@ extern "C" {
         dim = MSet_EntDim(mset);
 
         if (dim != MEDGE) continue; 
-        if (strncmp(mset_name,"sideset_",8) != 0) continue;
-
-        sscanf(mset_name+8,"%d",&sid);
+        if (!exo_export_sideset_id_from_mset(mesh,mset,mset_name,&sid))
+          continue;
 
         if (nsideset == nsalloc) {
           nsalloc *= 2;

@@ -118,6 +118,7 @@ extern "C" {
     MFace_ptr mf;
     MRegion_ptr mr;
     MAttrib_ptr nmapatt=NULL, elblockatt=NULL, nodesetatt=NULL, sidesetatt=NULL;
+    MAttrib_ptr sidesetsideatt=NULL;
     MSet_ptr faceset=NULL, nodeset=NULL, sideset=NULL, matset=NULL;
     int distributed=0;
     int timing = exo_serial_timing_enabled();
@@ -612,6 +613,13 @@ extern "C" {
                                             sideset_ids[i]);
 	
           sidesetatt = MAttrib_New(mesh,sidesetname,INT,MEDGE);
+          sidesetsideatt = NULL;
+          if (exo_serial_preserve_named_sidesets()) {
+            char sidesetsideattname[256];
+            snprintf(sidesetsideattname,sizeof(sidesetsideattname),
+                     "%s__side",sidesetname);
+            sidesetsideatt = MAttrib_New(mesh,sidesetsideattname,INT,MEDGE);
+          }
           sideset = MSet_New(mesh,sidesetname,MEDGE);
       
 #ifdef EXODUS_6_DEPRECATED
@@ -652,7 +660,12 @@ extern "C" {
 	  
             /* Set attribute value for this edge */
 	  
-            MEnt_Set_AttVal(me,sidesetatt,sideset_ids[i],0.0,NULL);
+            MEnt_Set_AttVal(me,sidesetatt,
+                            exo_serial_preserve_named_sidesets() ?
+                            ss_elem_list[j] : sideset_ids[i],
+                            0.0,NULL);
+            if (sidesetsideatt)
+              MEnt_Set_AttVal(me,sidesetsideatt,ss_side_list[j],0.0,NULL);
 
             /* Add the edge to a set */
 
@@ -1737,6 +1750,13 @@ extern "C" {
           if (mesh_type == 1) {
 
             sidesetatt = MAttrib_New(mesh,sidesetname,INT,MEDGE);
+            sidesetsideatt = NULL;
+            if (exo_serial_preserve_named_sidesets()) {
+              char sidesetsideattname[256];
+              snprintf(sidesetsideattname,sizeof(sidesetsideattname),
+                       "%s__side",sidesetname);
+              sidesetsideatt = MAttrib_New(mesh,sidesetsideattname,INT,MEDGE);
+            }
             sideset = MSet_New(mesh,sidesetname,MEDGE);          
       
             for (j = 0; j < num_sides_in_set; j++) {
@@ -1774,7 +1794,12 @@ extern "C" {
             
               /* Set attribute value for this face */
             
-              MEnt_Set_AttVal(me,sidesetatt,sideset_ids[i],0.0,NULL);
+              MEnt_Set_AttVal(me,sidesetatt,
+                              exo_serial_preserve_named_sidesets() ?
+                              ss_elem_list[j] : sideset_ids[i],
+                              0.0,NULL);
+              if (sidesetsideatt)
+                MEnt_Set_AttVal(me,sidesetsideatt,ss_side_list[j],0.0,NULL);
             
               /* Add the face to a set */
             
@@ -1791,6 +1816,13 @@ extern "C" {
           else if (mesh_type == 2) {
 
             sidesetatt = MAttrib_New(mesh,sidesetname,INT,MFACE);
+            sidesetsideatt = NULL;
+            if (exo_serial_preserve_named_sidesets()) {
+              char sidesetsideattname[256];
+              snprintf(sidesetsideattname,sizeof(sidesetsideattname),
+                       "%s__side",sidesetname);
+              sidesetsideatt = MAttrib_New(mesh,sidesetsideattname,INT,MFACE);
+            }
             sideset = MSet_New(mesh,sidesetname,MFACE);
       
             for (j = 0; j < num_sides_in_set; j++) {
@@ -1829,7 +1861,12 @@ extern "C" {
             
               /* Set attribute value for this face */
             
-              MEnt_Set_AttVal(mf,sidesetatt,sideset_ids[i],0.0,NULL);
+              MEnt_Set_AttVal(mf,sidesetatt,
+                              exo_serial_preserve_named_sidesets() ?
+                              ss_elem_list[j] : sideset_ids[i],
+                              0.0,NULL);
+              if (sidesetsideatt)
+                MEnt_Set_AttVal(mf,sidesetsideatt,ss_side_list[j],0.0,NULL);
             
               /* Add the face to a set */
             

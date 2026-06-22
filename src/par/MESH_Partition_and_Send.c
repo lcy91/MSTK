@@ -336,7 +336,8 @@ extern "C" {
         atttype = MAttrib_Get_Type(attrib);
         if (atttype == POINTER) continue;
         if (skip_side_set_attrs && atttype == INT &&
-            MAttrib_Get_EntDim(attrib) == side_dim) {
+            MAttrib_Get_EntDim(attrib) == side_dim &&
+            strncmp(attnames[a],"sideset_",8) != 0) {
           skipped_side_set_attrs++;
           continue;
         }
