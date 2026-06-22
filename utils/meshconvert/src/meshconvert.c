@@ -123,12 +123,13 @@ int main(int argc, char *argv[]) {
   int experimental_batched_set_copy=0;
   int experimental_preserve_named_sidesets=0;
   int experimental_sparse_sideset_export=0;
+  int experimental_ats_exo_workflow=0;
   MshFmt inmeshfmt, outmeshfmt;
   FILE *fp;
 
   if (argc < 3) {
     fprintf(stderr,"\n");
-    fprintf(stderr,"usage: meshconvert <--timing> <--experimental-skip-side-set-attrs> <--experimental-sparse-set-copy> <--experimental-batched-set-copy> <--experimental-preserve-named-sidesets> <--experimental-sparse-sideset-export> <--classify=0|n|1|y|2> <--partition=y|1|n|0> <--partition-method=0|1|2> <--parallel-check=y|1|n|0> <--weave=y|1|n|0> <--num-ghost-layers=?> <--check-topo=y|1|n|0> infilename outfilename\n\n");
+    fprintf(stderr,"usage: meshconvert <--timing> <--experimental-skip-side-set-attrs> <--experimental-sparse-set-copy> <--experimental-batched-set-copy> <--experimental-preserve-named-sidesets> <--experimental-sparse-sideset-export> <--experimental-ats-exo-workflow> <--classify=0|n|1|y|2> <--partition=y|1|n|0> <--partition-method=0|1|2> <--parallel-check=y|1|n|0> <--weave=y|1|n|0> <--num-ghost-layers=?> <--check-topo=y|1|n|0> infilename outfilename\n\n");
     fprintf(stderr,"partition-method = 0, METIS\n");
     fprintf(stderr,"                 = 1, ZOLTAN with GRAPH partioning\n");
     fprintf(stderr,"                 = 2, ZOLTAN with RCB partitioning\n");
@@ -204,6 +205,9 @@ int main(int argc, char *argv[]) {
         experimental_sparse_sideset_export = 1;
         setenv("MSTK_SPARSE_SIDESET_EXPORT", "1", 1);
         setenv("MSTK_SKIP_SIDE_SET_ATTR_COPY", "1", 1);
+      }
+      else if (strncmp(argv[i],"--experimental-ats-exo-workflow",31) == 0) {
+        experimental_ats_exo_workflow = 1;
       }
       else if (strncmp(argv[i],"--classify",10) == 0) {
         if (strncmp(argv[i]+11,"y",1) == 0 ||
@@ -367,6 +371,9 @@ int main(int argc, char *argv[]) {
     if (experimental_sparse_sideset_export)
       fprintf(stderr,
               "[meshconvert][timing] experimental-sparse-sideset-export enabled\n");
+    if (experimental_ats_exo_workflow)
+      fprintf(stderr,
+              "[meshconvert][timing] experimental-ats-exo-workflow enabled\n");
   }
 
   if (experimental_sparse_sideset_export && inmeshfmt == EXODUSII)
@@ -384,19 +391,84 @@ int main(int argc, char *argv[]) {
       
       if (rank == 0)
 	fprintf(stderr,"Importing mesh from ExodusII file...");
-      opts[0] = (partition > 0) ? 1 : 0;
-      opts[1] = (partition > 0) ? partition-1 : 0;
-      opts[2] = 1;  /* 1 layer of ghosts */
-      opts[3] = partmethod;
 
-      mesh = MESH_New(F1);
-      double import_t0 = meshconvert_wtime();
-      ok = MESH_ImportFromFile(mesh,infname,"exodusii",opts,comm);
-      double import_t1 = meshconvert_wtime();
-      if (timing) {
-        meshconvert_print_time("MESH_ImportFromFile", import_t0, import_t1,
-                               rank, comm);
-        meshconvert_print_memory("after MESH_ImportFromFile", rank, comm);
+      if (experimental_ats_exo_workflow && partition > 0) {
+#ifdef MSTK_HAVE_MPI
+        Mesh_ptr serial_mesh = NULL;
+        int dim = 0;
+        int ring = 1;
+        int with_attr = 1;
+        int del_inmesh = 1;
+
+        if (rank == 0) {
+          serial_mesh = MESH_New(F1);
+          double import_t0 = meshconvert_wtime();
+          ok = MESH_ImportFromFile(serial_mesh,infname,"exodusii",NULL,comm);
+          double import_t1 = meshconvert_wtime();
+          if (timing)
+            meshconvert_print_time("ATS MESH_ImportFromExodusII",
+                                   import_t0, import_t1, rank, NULL);
+          if (!ok)
+            MSTK_Report("meshconvert",
+                        "ATS workflow Exodus import failed", MSTK_FATAL);
+
+          double renum_t0 = meshconvert_wtime();
+          MESH_Renumber(serial_mesh,0,MALLTYPE);
+          double renum_t1 = meshconvert_wtime();
+          if (timing)
+            meshconvert_print_time("ATS MESH_Renumber local IDs",
+                                   renum_t0, renum_t1, rank, NULL);
+
+          dim = MESH_Num_Regions(serial_mesh) ? 3 : 2;
+        }
+        MPI_Bcast(&dim, 1, MPI_INT, 0, comm);
+
+        double dist_t0 = meshconvert_wtime();
+        ok = MSTK_Mesh_Distribute(serial_mesh, &mesh, &dim, ring, with_attr,
+                                  partmethod, del_inmesh, comm);
+        double dist_t1 = meshconvert_wtime();
+        if (timing) {
+          meshconvert_print_time("ATS MSTK_Mesh_Distribute",
+                                 dist_t0, dist_t1, rank, comm);
+          meshconvert_print_memory("after ATS MSTK_Mesh_Distribute",
+                                   rank, comm);
+        }
+        if (!ok)
+          MSTK_Report("meshconvert",
+                      "ATS workflow MSTK_Mesh_Distribute failed",
+                      MSTK_FATAL);
+
+        double gid_t0 = meshconvert_wtime();
+        ok = MESH_Renumber_GlobalIDs(mesh,MALLTYPE,0,NULL,comm);
+        double gid_t1 = meshconvert_wtime();
+        if (timing)
+          meshconvert_print_time("ATS MESH_Renumber_GlobalIDs",
+                                 gid_t0, gid_t1, rank, comm);
+        if (!ok)
+          MSTK_Report("meshconvert",
+                      "ATS workflow MESH_Renumber_GlobalIDs failed",
+                      MSTK_FATAL);
+#else
+        MSTK_Report("meshconvert",
+                    "ATS Exodus workflow partitioning requires MPI",
+                    MSTK_FATAL);
+#endif
+      }
+      else {
+        opts[0] = (partition > 0) ? 1 : 0;
+        opts[1] = (partition > 0) ? partition-1 : 0;
+        opts[2] = 1;  /* 1 layer of ghosts */
+        opts[3] = partmethod;
+
+        mesh = MESH_New(F1);
+        double import_t0 = meshconvert_wtime();
+        ok = MESH_ImportFromFile(mesh,infname,"exodusii",opts,comm);
+        double import_t1 = meshconvert_wtime();
+        if (timing) {
+          meshconvert_print_time("MESH_ImportFromFile", import_t0, import_t1,
+                                 rank, comm);
+          meshconvert_print_memory("after MESH_ImportFromFile", rank, comm);
+        }
       }
 
     } else {
@@ -491,7 +563,10 @@ int main(int argc, char *argv[]) {
 
     /* Figure out geometric classification */
     
-    if (build_classfn) {  /* works correctly only for un-partitioned meshes */
+    if (experimental_ats_exo_workflow && build_classfn && rank == 0 && timing)
+      fprintf(stderr,
+              "[meshconvert][timing] skipping MESH_BuildClassfn in ATS Exodus workflow mode\n");
+    if (build_classfn && !experimental_ats_exo_workflow) {  /* works correctly only for un-partitioned meshes */
       if (rank == 0) {
 	fprintf(stderr,"Building classification information....");
 	
