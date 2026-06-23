@@ -425,6 +425,15 @@ extern "C" {
     return 1;
   }
 
+  static int exo_export_expand_sparse_sideset(int set_index,
+                                             char **side_set_names_glob) {
+    const char *name;
+    if (!side_set_names_glob || set_index < 0)
+      return 0;
+    name = side_set_names_glob[set_index];
+    return name && strncmp(name,"scell_",6) == 0;
+  }
+
   static MRegion_ptr exo_export_matching_sideset_region(
       MFace_ptr mf, List_ptr fregs, const char *sideset_name,
       int num_element_set_glob, MSet_ptr *element_sets_glob,
@@ -1797,6 +1806,7 @@ extern "C" {
                         MSTK_FATAL);
 
           for (i = 0; i < total_recv_int; i += 3) {
+            int set_index = recvbuf[i];
             int owner_gid = recvbuf[i+1];
             int exo_side = recvbuf[i+2];
             MRegion_ptr owner_mr = NULL;
@@ -1805,6 +1815,12 @@ extern "C" {
             int nfregs, k;
 
             if (owner_gid <= 0 || owner_gid > global_max_gid) continue;
+            if (!exo_export_expand_sparse_sideset(set_index,
+                                                  side_set_names_glob)) {
+              int dest = owner_rank[owner_gid];
+              if (dest >= 0) exp_send_counts[dest] += 3;
+              continue;
+            }
             owner_mr = owner_region[owner_gid];
             if (!owner_mr) continue;
 
@@ -1865,6 +1881,18 @@ extern "C" {
             int nfregs, k;
 
             if (owner_gid <= 0 || owner_gid > global_max_gid) continue;
+            if (!exo_export_expand_sparse_sideset(set_index,
+                                                  side_set_names_glob)) {
+              int dest = owner_rank[owner_gid];
+              int pos;
+              if (dest < 0) continue;
+              pos = exp_send_pos[dest];
+              exp_sendbuf[pos] = set_index;
+              exp_sendbuf[pos+1] = owner_gid;
+              exp_sendbuf[pos+2] = exo_side;
+              exp_send_pos[dest] += 3;
+              continue;
+            }
             owner_mr = owner_region[owner_gid];
             if (!owner_mr) continue;
 
