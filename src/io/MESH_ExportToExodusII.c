@@ -357,6 +357,7 @@ extern "C" {
     float version;
     ex_init_params exopar;
     MType side_dim = (meshdim == 3) ? MFACE : MEDGE;
+    char **file_sideset_names = NULL;
 
     if (!mesh || !filename || !num_side_set_glob || !side_sets_glob ||
         !side_set_ids_glob || !side_set_names_glob)
@@ -369,6 +370,7 @@ extern "C" {
       MSTK_Report("MESH_ExportToExodusII",
                   "Could not open input Exodus file for sparse side sets",
                   MSTK_FATAL);
+    ex_set_max_name_length(exoid,255);
 
     memset(&exopar,0,sizeof(ex_init_params));
     status = ex_get_init_ext(exoid,&exopar);
@@ -402,11 +404,34 @@ extern "C" {
                   "Could not read side-set IDs from input Exodus file",
                   MSTK_FATAL);
 
+    file_sideset_names =
+      (char **) calloc(exopar.num_side_sets,sizeof(char *));
+    if (!file_sideset_names)
+      MSTK_Report("MESH_ExportToExodusII",
+                  "Could not allocate sparse Exodus side-set names",
+                  MSTK_FATAL);
+    for (i = 0; i < exopar.num_side_sets; i++) {
+      file_sideset_names[i] = (char *) calloc(256,sizeof(char));
+      if (!file_sideset_names[i])
+        MSTK_Report("MESH_ExportToExodusII",
+                    "Could not allocate sparse Exodus side-set name",
+                    MSTK_FATAL);
+    }
+    status = ex_get_names(exoid, EX_SIDE_SET, file_sideset_names);
+    if (status < 0)
+      MSTK_Report("MESH_ExportToExodusII",
+                  "Could not read sparse Exodus side-set names",
+                  MSTK_FATAL);
+
     for (i = 0; i < exopar.num_side_sets; i++) {
       char sidesetname[256], tmpname[256];
       sidesetname[0] = '\0';
-      status = ex_get_name(exoid, EX_SIDE_SET, (*side_set_ids_glob)[i],
-                           sidesetname);
+      exo_export_copy_name(sidesetname,file_sideset_names[i],256);
+      if (sidesetname[0] == '\0')
+        status = ex_get_name(exoid, EX_SIDE_SET, (*side_set_ids_glob)[i],
+                             sidesetname);
+      else
+        status = 0;
       if (status != 0 || sidesetname[0] == '\0')
         sprintf(sidesetname,"sideset_%-d",(*side_set_ids_glob)[i]);
 
@@ -421,6 +446,9 @@ extern "C" {
       (*side_sets_glob)[i] = MSet_New(mesh,tmpname,side_dim);
     }
 
+    for (i = 0; i < exopar.num_side_sets; i++)
+      free(file_sideset_names[i]);
+    free(file_sideset_names);
     ex_close(exoid);
     return 1;
   }
@@ -470,8 +498,11 @@ extern "C" {
   static int exo_export_read_sparse_element_set_names(
       const char *filename, int num_element_set_glob,
       int *element_set_ids_glob, char ***element_set_names_glob) {
-    int exoid, cpu_ws, io_ws, status, i;
+    int exoid, cpu_ws, io_ws, status, i, j;
+    int *file_elemset_ids = NULL;
+    char **file_elemset_names = NULL;
     float version;
+    ex_init_params exopar;
 
     if (!filename || !element_set_names_glob)
       return 0;
@@ -494,12 +525,61 @@ extern "C" {
       MSTK_Report("MESH_ExportToExodusII",
                   "Could not open input Exodus file for sparse element sets",
                   MSTK_FATAL);
+    ex_set_max_name_length(exoid,255);
+
+    memset(&exopar,0,sizeof(exopar));
+    status = ex_get_init_ext(exoid,&exopar);
+    if (status < 0)
+      MSTK_Report("MESH_ExportToExodusII",
+                  "Could not read sparse Exodus header for element sets",
+                  MSTK_FATAL);
+
+    if (exopar.num_elem_sets) {
+      file_elemset_ids = (int *) malloc(exopar.num_elem_sets*sizeof(int));
+      file_elemset_names =
+        (char **) calloc(exopar.num_elem_sets,sizeof(char *));
+      if (!file_elemset_ids || !file_elemset_names)
+        MSTK_Report("MESH_ExportToExodusII",
+                    "Could not allocate sparse Exodus element-set map",
+                    MSTK_FATAL);
+
+      for (i = 0; i < exopar.num_elem_sets; i++) {
+        file_elemset_names[i] = (char *) calloc(256,sizeof(char));
+        if (!file_elemset_names[i])
+          MSTK_Report("MESH_ExportToExodusII",
+                      "Could not allocate sparse Exodus element-set name",
+                      MSTK_FATAL);
+      }
+
+      status = ex_get_ids(exoid, EX_ELEM_SET, file_elemset_ids);
+      if (status < 0)
+        MSTK_Report("MESH_ExportToExodusII",
+                    "Could not read sparse Exodus element-set IDs",
+                    MSTK_FATAL);
+
+      status = ex_get_names(exoid, EX_ELEM_SET, file_elemset_names);
+      if (status < 0)
+        MSTK_Report("MESH_ExportToExodusII",
+                    "Could not read sparse Exodus element-set names",
+                    MSTK_FATAL);
+    }
 
     for (i = 0; i < num_element_set_glob; i++) {
       char elemsetname[256];
       elemsetname[0] = '\0';
-      status = ex_get_name(exoid, EX_ELEM_SET, element_set_ids_glob[i],
-                           elemsetname);
+
+      for (j = 0; j < exopar.num_elem_sets; j++) {
+        if (file_elemset_ids[j] == element_set_ids_glob[i]) {
+          exo_export_copy_name(elemsetname,file_elemset_names[j],256);
+          break;
+        }
+      }
+
+      if (elemsetname[0] == '\0')
+        status = ex_get_name(exoid, EX_ELEM_SET, element_set_ids_glob[i],
+                             elemsetname);
+      else
+        status = 0;
       if (status != 0 || elemsetname[0] == '\0')
         sprintf(elemsetname,"elemset_%-d",element_set_ids_glob[i]);
 
@@ -511,6 +591,12 @@ extern "C" {
       exo_export_copy_name((*element_set_names_glob)[i],elemsetname,256);
     }
 
+    if (file_elemset_names) {
+      for (i = 0; i < exopar.num_elem_sets; i++)
+        free(file_elemset_names[i]);
+      free(file_elemset_names);
+    }
+    free(file_elemset_ids);
     ex_close(exoid);
     return 1;
   }
