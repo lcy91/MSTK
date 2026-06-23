@@ -434,6 +434,110 @@ extern "C" {
     return name && strncmp(name,"scell_",6) == 0;
   }
 
+  static int exo_export_sparse_target_element_name(const char *side_name,
+                                                   char *target_name,
+                                                   size_t target_len) {
+    const char *suffix = NULL;
+    char *face_pos = NULL;
+
+    if (!side_name || !target_name || !target_len)
+      return 0;
+    target_name[0] = '\0';
+
+    suffix = strrchr(side_name,'_');
+    if (!suffix || suffix[1] == '\0')
+      return 0;
+
+    if (strncmp(side_name,"scell_surf_face_",16) == 0 ||
+        strncmp(side_name,"scell_subs_face_",16) == 0) {
+      snprintf(target_name,target_len,"scell_subs_cell_%s",suffix+1);
+      return 1;
+    }
+
+    if (strncmp(side_name,"scell_subs_interface_face_",26) == 0) {
+      strncpy(target_name,side_name,target_len);
+      target_name[target_len-1] = '\0';
+      face_pos = strstr(target_name,"_face_");
+      if (!face_pos)
+        return 0;
+      memcpy(face_pos,"_cell_",6);
+      return 1;
+    }
+
+    return 0;
+  }
+
+  static int exo_export_read_sparse_element_set_names(
+      const char *filename, int num_element_set_glob,
+      int *element_set_ids_glob, char ***element_set_names_glob) {
+    int exoid, cpu_ws, io_ws, status, i;
+    float version;
+
+    if (!filename || !element_set_names_glob)
+      return 0;
+
+    *element_set_names_glob = NULL;
+    if (!num_element_set_glob)
+      return 1;
+
+    *element_set_names_glob =
+      (char **) calloc(num_element_set_glob,sizeof(char *));
+    if (!*element_set_names_glob)
+      MSTK_Report("MESH_ExportToExodusII",
+                  "Could not allocate sparse element-set names",
+                  MSTK_FATAL);
+
+    cpu_ws = sizeof(double);
+    io_ws = sizeof(double);
+    exoid = ex_open(filename, EX_READ, &cpu_ws, &io_ws, &version);
+    if (exoid < 0)
+      MSTK_Report("MESH_ExportToExodusII",
+                  "Could not open input Exodus file for sparse element sets",
+                  MSTK_FATAL);
+
+    for (i = 0; i < num_element_set_glob; i++) {
+      char elemsetname[256];
+      elemsetname[0] = '\0';
+      status = ex_get_name(exoid, EX_ELEM_SET, element_set_ids_glob[i],
+                           elemsetname);
+      if (status != 0 || elemsetname[0] == '\0')
+        sprintf(elemsetname,"elemset_%-d",element_set_ids_glob[i]);
+
+      (*element_set_names_glob)[i] = (char *) calloc(256,sizeof(char));
+      if (!(*element_set_names_glob)[i])
+        MSTK_Report("MESH_ExportToExodusII",
+                    "Could not allocate sparse element-set name",
+                    MSTK_FATAL);
+      exo_export_copy_name((*element_set_names_glob)[i],elemsetname,256);
+    }
+
+    ex_close(exoid);
+    return 1;
+  }
+
+  static int exo_export_sparse_target_element_set(
+      int set_index, char **side_set_names_glob,
+      int num_element_set_glob, char **element_set_names_glob) {
+    char target_name[256];
+    int i;
+
+    if (!side_set_names_glob || !element_set_names_glob ||
+        set_index < 0 || !side_set_names_glob[set_index])
+      return -1;
+
+    if (!exo_export_sparse_target_element_name(side_set_names_glob[set_index],
+                                               target_name,
+                                               sizeof(target_name)))
+      return -1;
+
+    for (i = 0; i < num_element_set_glob; i++)
+      if (element_set_names_glob[i] &&
+          strcmp(element_set_names_glob[i],target_name) == 0)
+        return i;
+
+    return -1;
+  }
+
   static MRegion_ptr exo_export_matching_sideset_region(
       MFace_ptr mf, List_ptr fregs, const char *sideset_name,
       int num_element_set_glob, MSet_ptr *element_sets_glob,
@@ -554,7 +658,7 @@ extern "C" {
     char **element_block_types_glob, block_name[256];
     char **element_att_names_glob, **node_att_names_glob, 
       **sideset_att_names_glob, **elementset_att_names_glob,
-      **side_set_names_glob;
+      **side_set_names_glob, **element_set_names_glob;
     MSet_ptr *element_blocks_glob, *side_sets_glob, *node_sets_glob, 
       *element_sets_glob;
     List_ptr face_block;
@@ -573,6 +677,8 @@ extern "C" {
 			        {5,6,1,2,3,4}};/* HEX */
     int rank, numprocs;
     int timing = exo_export_timing_enabled();
+
+    element_set_names_glob = NULL;
 
 
     int meshdim;
@@ -1048,6 +1154,12 @@ extern "C" {
     /* COLLECT SIDE SET INFO */
 
     const char *sparse_sideset_file = exo_export_sparse_sideset_file();
+    if (sparse_sideset_file)
+      exo_export_read_sparse_element_set_names(sparse_sideset_file,
+                                               num_element_set_glob,
+                                               element_set_ids_glob,
+                                               &element_set_names_glob);
+
     double collect_sideset_t0 = exo_export_wtime();
     if (sparse_sideset_file)
       exo_export_read_sparse_sideset_metadata(mesh, sparse_sideset_file,
@@ -1812,11 +1924,22 @@ extern "C" {
             MRegion_ptr owner_mr = NULL;
             List_ptr rfaces = NULL, fregs = NULL;
             MFace_ptr side_face = NULL;
+            int target_set_index = -1;
             int nfregs, k;
 
             if (owner_gid <= 0 || owner_gid > global_max_gid) continue;
             if (!exo_export_expand_sparse_sideset(set_index,
                                                   side_set_names_glob)) {
+              int dest = owner_rank[owner_gid];
+              if (dest >= 0) exp_send_counts[dest] += 3;
+              continue;
+            }
+            target_set_index =
+              exo_export_sparse_target_element_set(set_index,
+                                                   side_set_names_glob,
+                                                   num_element_set_glob,
+                                                   element_set_names_glob);
+            if (target_set_index < 0) {
               int dest = owner_rank[owner_gid];
               if (dest >= 0) exp_send_counts[dest] += 3;
               continue;
@@ -1836,6 +1959,8 @@ extern "C" {
               int target_gid = exo_export_region_owner_key(adj_mr,
                                                            sparse_owner_att);
               int dest;
+              if (!MSet_Contains(element_sets_glob[target_set_index],adj_mr))
+                continue;
               if (target_gid <= 0 || target_gid > global_max_gid) continue;
               dest = owner_rank[target_gid];
               if (dest >= 0) exp_send_counts[dest] += 3;
@@ -1878,11 +2003,28 @@ extern "C" {
             MRegion_ptr owner_mr = NULL;
             List_ptr rfaces = NULL, fregs = NULL;
             MFace_ptr side_face = NULL;
+            int target_set_index = -1;
             int nfregs, k;
 
             if (owner_gid <= 0 || owner_gid > global_max_gid) continue;
             if (!exo_export_expand_sparse_sideset(set_index,
                                                   side_set_names_glob)) {
+              int dest = owner_rank[owner_gid];
+              int pos;
+              if (dest < 0) continue;
+              pos = exp_send_pos[dest];
+              exp_sendbuf[pos] = set_index;
+              exp_sendbuf[pos+1] = owner_gid;
+              exp_sendbuf[pos+2] = exo_side;
+              exp_send_pos[dest] += 3;
+              continue;
+            }
+            target_set_index =
+              exo_export_sparse_target_element_set(set_index,
+                                                   side_set_names_glob,
+                                                   num_element_set_glob,
+                                                   element_set_names_glob);
+            if (target_set_index < 0) {
               int dest = owner_rank[owner_gid];
               int pos;
               if (dest < 0) continue;
@@ -1909,6 +2051,8 @@ extern "C" {
                                                            sparse_owner_att);
               int target_side = MF_LocalID_in_Region(side_face,adj_mr) + 1;
               int dest, pos;
+              if (!MSet_Contains(element_sets_glob[target_set_index],adj_mr))
+                continue;
               if (target_gid <= 0 || target_gid > global_max_gid) continue;
               if (target_side <= 0) continue;
               dest = owner_rank[target_gid];
@@ -2875,6 +3019,11 @@ extern "C" {
 
     if (num_element_set_glob) {
       free(element_set_ids_glob);
+      if (element_set_names_glob) {
+        for (i = 0; i < num_element_set_glob; i++)
+          free(element_set_names_glob[i]);
+        free(element_set_names_glob);
+      }
       for (i = 0; i < num_element_set_glob; i++) {
         MSet_Name(element_sets_glob[i],msetname);
         if (strncmp(msetname,"TEMPORARY_",10) == 0) 
