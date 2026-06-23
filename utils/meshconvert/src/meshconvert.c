@@ -452,8 +452,7 @@ int main(int argc, char *argv[]) {
                         MSTK_FATAL);
 
           while ((mr = MESH_Next_Region(mesh,&idx)))
-            if (MR_PType(mr) != PGHOST)
-              MEnt_Set_AttVal(mr,orig_gid_att,MR_GlobalID(mr),0.0,NULL);
+            MEnt_Set_AttVal(mr,orig_gid_att,MR_GlobalID(mr),0.0,NULL);
 
           setenv("MSTK_SPARSE_SIDESET_OWNER_ATTR",
                  MSTK_ATS_ORIG_ELEM_GID_ATT,1);

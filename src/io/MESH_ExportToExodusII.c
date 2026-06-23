@@ -1783,6 +1783,139 @@ extern "C" {
         MPI_Alltoallv(sendbuf,send_counts,send_displs,MPI_INT,
                       recvbuf,recv_counts_int,recv_displs_int,MPI_INT,comm);
 
+        if (sparse_sideset_file) {
+          int *exp_send_counts = NULL, *exp_recv_counts = NULL;
+          int *exp_send_displs = NULL, *exp_recv_displs = NULL;
+          int *exp_send_pos = NULL, *exp_sendbuf = NULL, *exp_recvbuf = NULL;
+          int exp_total_send = 0, exp_total_recv = 0;
+
+          exp_send_counts = (int *) calloc(numprocs,sizeof(int));
+          exp_recv_counts = (int *) calloc(numprocs,sizeof(int));
+          if (!exp_send_counts || !exp_recv_counts)
+            MSTK_Report("MESH_ExportToExodusII",
+                        "Could not allocate sparse side-set expansion counts",
+                        MSTK_FATAL);
+
+          for (i = 0; i < total_recv_int; i += 3) {
+            int owner_gid = recvbuf[i+1];
+            int exo_side = recvbuf[i+2];
+            MRegion_ptr owner_mr = NULL;
+            List_ptr rfaces = NULL, fregs = NULL;
+            MFace_ptr side_face = NULL;
+            int nfregs, k;
+
+            if (owner_gid <= 0 || owner_gid > global_max_gid) continue;
+            owner_mr = owner_region[owner_gid];
+            if (!owner_mr) continue;
+
+            rfaces = MR_Faces(owner_mr);
+            side_face = List_Entry(rfaces,exo_side-1);
+            if (rfaces) List_Delete(rfaces);
+            if (!side_face) continue;
+
+            fregs = MF_Regions(side_face);
+            nfregs = fregs ? List_Num_Entries(fregs) : 0;
+            for (k = 0; k < nfregs; k++) {
+              MRegion_ptr adj_mr = List_Entry(fregs,k);
+              int target_gid = exo_export_region_owner_key(adj_mr,
+                                                           sparse_owner_att);
+              int dest;
+              if (target_gid <= 0 || target_gid > global_max_gid) continue;
+              dest = owner_rank[target_gid];
+              if (dest >= 0) exp_send_counts[dest] += 3;
+            }
+            if (fregs) List_Delete(fregs);
+          }
+
+          MPI_Alltoall(exp_send_counts,1,MPI_INT,
+                       exp_recv_counts,1,MPI_INT,comm);
+
+          exp_send_displs = (int *) calloc(numprocs,sizeof(int));
+          exp_recv_displs = (int *) calloc(numprocs,sizeof(int));
+          exp_send_pos = (int *) calloc(numprocs,sizeof(int));
+          if (!exp_send_displs || !exp_recv_displs || !exp_send_pos)
+            MSTK_Report("MESH_ExportToExodusII",
+                        "Could not allocate sparse side-set expansion displs",
+                        MSTK_FATAL);
+          for (i = 0; i < numprocs; i++) {
+            exp_send_displs[i] = exp_total_send;
+            exp_total_send += exp_send_counts[i];
+            exp_recv_displs[i] = exp_total_recv;
+            exp_total_recv += exp_recv_counts[i];
+            exp_send_pos[i] = exp_send_displs[i];
+          }
+
+          exp_sendbuf = exp_total_send ?
+            (int *) malloc(exp_total_send*sizeof(int)) : NULL;
+          exp_recvbuf = exp_total_recv ?
+            (int *) malloc(exp_total_recv*sizeof(int)) : NULL;
+          if ((exp_total_send && !exp_sendbuf) ||
+              (exp_total_recv && !exp_recvbuf))
+            MSTK_Report("MESH_ExportToExodusII",
+                        "Could not allocate sparse side-set expansion buffers",
+                        MSTK_FATAL);
+
+          for (i = 0; i < total_recv_int; i += 3) {
+            int set_index = recvbuf[i];
+            int owner_gid = recvbuf[i+1];
+            int exo_side = recvbuf[i+2];
+            MRegion_ptr owner_mr = NULL;
+            List_ptr rfaces = NULL, fregs = NULL;
+            MFace_ptr side_face = NULL;
+            int nfregs, k;
+
+            if (owner_gid <= 0 || owner_gid > global_max_gid) continue;
+            owner_mr = owner_region[owner_gid];
+            if (!owner_mr) continue;
+
+            rfaces = MR_Faces(owner_mr);
+            side_face = List_Entry(rfaces,exo_side-1);
+            if (rfaces) List_Delete(rfaces);
+            if (!side_face) continue;
+
+            fregs = MF_Regions(side_face);
+            nfregs = fregs ? List_Num_Entries(fregs) : 0;
+            for (k = 0; k < nfregs; k++) {
+              MRegion_ptr adj_mr = List_Entry(fregs,k);
+              int target_gid = exo_export_region_owner_key(adj_mr,
+                                                           sparse_owner_att);
+              int target_side = MF_LocalID_in_Region(side_face,adj_mr) + 1;
+              int dest, pos;
+              if (target_gid <= 0 || target_gid > global_max_gid) continue;
+              if (target_side <= 0) continue;
+              dest = owner_rank[target_gid];
+              if (dest < 0) continue;
+              pos = exp_send_pos[dest];
+              exp_sendbuf[pos] = set_index;
+              exp_sendbuf[pos+1] = target_gid;
+              exp_sendbuf[pos+2] = target_side;
+              exp_send_pos[dest] += 3;
+            }
+            if (fregs) List_Delete(fregs);
+          }
+
+          MPI_Alltoallv(exp_sendbuf,exp_send_counts,exp_send_displs,MPI_INT,
+                        exp_recvbuf,exp_recv_counts,exp_recv_displs,MPI_INT,
+                        comm);
+
+          free(send_counts);
+          free(recv_counts_int);
+          free(send_displs);
+          free(recv_displs_int);
+          free(send_pos);
+          free(sendbuf);
+          free(recvbuf);
+
+          send_counts = exp_send_counts;
+          recv_counts_int = exp_recv_counts;
+          send_displs = exp_send_displs;
+          recv_displs_int = exp_recv_displs;
+          send_pos = exp_send_pos;
+          sendbuf = exp_sendbuf;
+          recvbuf = exp_recvbuf;
+          total_recv_int = exp_total_recv;
+        }
+
         for (i = 0; i < total_recv_int; i += 3) {
           int set_index = recvbuf[i];
           int owner_gid = recvbuf[i+1];
