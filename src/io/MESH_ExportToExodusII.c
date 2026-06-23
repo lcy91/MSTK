@@ -2144,13 +2144,28 @@ extern "C" {
     int *concat_element_set_entry_index = NULL;
     int *concat_element_set_df_index = NULL;
     int *concat_element_set_list = NULL;
+    int *element_set_valid_counts = NULL;
     int concat_element_set_max_entries = 0;
     int concat_element_set_entries = 0;
 
     if (num_element_set_glob) {
-      for (i = 0; i < num_element_set_glob; i++)
-        concat_element_set_max_entries +=
-          MSet_Num_Entries(element_sets_glob[i]);
+      element_set_valid_counts =
+        (int *) calloc(num_element_set_glob,sizeof(int));
+      if (!element_set_valid_counts)
+        MSTK_Report("MESH_ExportToExodusII",
+                    "Could not allocate element set valid counts",
+                    MSTK_FATAL);
+
+      for (i = 0; i < num_element_set_glob; i++) {
+        MEntity_ptr ment;
+        idx = 0;
+        while ((ment = MSet_Next_Entry(element_sets_glob[i],&idx))) {
+          int local_elem = elem_id[MEnt_ID(ment)-1];
+          if (local_elem > 0)
+            element_set_valid_counts[i]++;
+        }
+        concat_element_set_max_entries += element_set_valid_counts[i];
+      }
 
       concat_element_set_ids =
         (int *) calloc(num_element_set_glob,sizeof(int));
@@ -2177,7 +2192,11 @@ extern "C" {
 #endif
 
     for (i = 0; i < num_element_set_glob; i++) {
-      int nelements = MSet_Num_Entries(element_sets_glob[i]);
+      int nelements =
+#ifndef EXODUS_6_DEPRECATED
+        element_set_valid_counts ? element_set_valid_counts[i] :
+#endif
+        MSet_Num_Entries(element_sets_glob[i]);
 #ifdef EXODUS_6_DEPRECATED
       ex_put_set_param(exoid, EX_ELEM_SET, element_set_ids_glob[i], nelements, 0);
 
@@ -2190,8 +2209,13 @@ extern "C" {
 
       MEntity_ptr ment;
       idx = 0; j = 0;
-      while ((ment = MSet_Next_Entry(element_sets_glob[i],&idx)))
-        element_list[j++] = elem_id[MEnt_ID(ment)-1];
+      while ((ment = MSet_Next_Entry(element_sets_glob[i],&idx))) {
+        int local_elem = elem_id[MEnt_ID(ment)-1];
+#ifndef EXODUS_6_DEPRECATED
+        if (local_elem <= 0) continue;
+#endif
+        element_list[j++] = local_elem;
+      }
 
 #ifdef EXODUS_6_DEPRECATED
       ex_put_set(exoid, EX_ELEM_SET, element_set_ids_glob[i], element_list, NULL);
@@ -2229,6 +2253,7 @@ extern "C" {
       free(concat_element_set_entry_index);
       free(concat_element_set_df_index);
       free(concat_element_set_list);
+      free(element_set_valid_counts);
     }
 #endif
     double write_elementset_t1 = exo_export_wtime();
