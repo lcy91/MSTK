@@ -126,12 +126,13 @@ int main(int argc, char *argv[]) {
   int experimental_preserve_named_sidesets=0;
   int experimental_sparse_sideset_export=0;
   int experimental_ats_exo_workflow=0;
+  int experimental_strict_column_partition=0;
   MshFmt inmeshfmt, outmeshfmt;
   FILE *fp;
 
   if (argc < 3) {
     fprintf(stderr,"\n");
-    fprintf(stderr,"usage: meshconvert <--timing> <--experimental-skip-side-set-attrs> <--experimental-sparse-set-copy> <--experimental-batched-set-copy> <--experimental-preserve-named-sidesets> <--experimental-sparse-sideset-export> <--experimental-ats-exo-workflow> <--classify=0|n|1|y|2> <--partition=y|1|n|0> <--partition-method=0|1|2> <--parallel-check=y|1|n|0> <--weave=y|1|n|0> <--num-ghost-layers=?> <--check-topo=y|1|n|0> infilename outfilename\n\n");
+    fprintf(stderr,"usage: meshconvert <--timing> <--experimental-skip-side-set-attrs> <--experimental-sparse-set-copy> <--experimental-batched-set-copy> <--experimental-preserve-named-sidesets> <--experimental-sparse-sideset-export> <--experimental-ats-exo-workflow> <--experimental-strict-column-partition> <--classify=0|n|1|y|2> <--partition=y|1|n|0> <--partition-method=0|1|2> <--parallel-check=y|1|n|0> <--weave=y|1|n|0> <--num-ghost-layers=?> <--check-topo=y|1|n|0> infilename outfilename\n\n");
     fprintf(stderr,"partition-method = 0, METIS\n");
     fprintf(stderr,"                 = 1, ZOLTAN with GRAPH partioning\n");
     fprintf(stderr,"                 = 2, ZOLTAN with RCB partitioning\n");
@@ -210,6 +211,10 @@ int main(int argc, char *argv[]) {
       }
       else if (strncmp(argv[i],"--experimental-ats-exo-workflow",31) == 0) {
         experimental_ats_exo_workflow = 1;
+      }
+      else if (strncmp(argv[i],"--experimental-strict-column-partition",38) == 0) {
+        experimental_strict_column_partition = 1;
+        setenv("MSTK_STRICT_COLUMN_PARTITION", "1", 1);
       }
       else if (strncmp(argv[i],"--classify",10) == 0) {
         if (strncmp(argv[i]+11,"y",1) == 0 ||
@@ -376,6 +381,9 @@ int main(int argc, char *argv[]) {
     if (experimental_ats_exo_workflow)
       fprintf(stderr,
               "[meshconvert][timing] experimental-ats-exo-workflow enabled\n");
+    if (experimental_strict_column_partition)
+      fprintf(stderr,
+              "[meshconvert][timing] experimental-strict-column-partition enabled\n");
   }
 
   if (experimental_sparse_sideset_export && inmeshfmt == EXODUSII)

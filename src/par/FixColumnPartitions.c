@@ -27,6 +27,16 @@ https://github.com/MeshToolkit/MSTK/blob/master/LICENSE
 extern "C" {
 #endif
 
+static int FixColumnPartitions_Strict(void) {
+  const char *val = getenv("MSTK_STRICT_COLUMN_PARTITION");
+  return (val && val[0] != '\0' && val[0] != '0');
+}
+
+static int FixColumnPartitions_Verbose(void) {
+  const char *val = getenv("MSTK_MESHCONVERT_TIMING");
+  return (val && val[0] != '\0' && val[0] != '0');
+}
+
 int FixColumnPartitions_IsSideFace(Mesh_ptr mesh, MRegion_ptr mr, MFace_ptr rf) {
   double fxyz[MAXPV2][3];
   double znorm;
@@ -129,6 +139,8 @@ int FixColumnPartitions(Mesh_ptr mesh, int *part, MSTK_Comm comm) {
   int idx, curid, nxtid, homepid, nxtpid, num_cols, num_cells_in_col;
   int num_touches, num_not_touched;
   int interior, done, nmove=0;
+  int strict = FixColumnPartitions_Strict();
+  int verbose = FixColumnPartitions_Verbose();
   MRegion_ptr mr, curreg, nxtreg;
   MFace_ptr topf, botf, expected_topf;
   List_ptr fregs;
@@ -207,9 +219,11 @@ int FixColumnPartitions(Mesh_ptr mesh, int *part, MSTK_Comm comm) {
 #endif
   }
 
-  if (nmove) {
+  if (nmove || verbose) {
     char msg[256];
-    sprintf(msg,"Redistributed %-d elements in %-d columns to maintain column partitioning",nmove, num_cols);
+    sprintf(msg,
+            "Checked %-d columns and %-d cells; redistributed %-d elements to maintain column partitioning",
+            num_cols, num_touches, nmove);
     MSTK_Report("FixColumnPartitions",msg,MSTK_MESG);
   }
 #ifdef DEBUG
@@ -227,7 +241,7 @@ int FixColumnPartitions(Mesh_ptr mesh, int *part, MSTK_Comm comm) {
   if (num_not_touched > 0) {
     char msg[256];
     sprintf(msg,"Mesh is not columnar, iteration process did not touch %-d cells, did perform %-d touches.", num_not_touched, num_touches);
-    MSTK_Report("FixColumnPartitions",msg,MSTK_MESG);
+    MSTK_Report("FixColumnPartitions",msg, strict ? MSTK_FATAL : MSTK_MESG);
   }
   free(touched);
   
@@ -237,4 +251,3 @@ int FixColumnPartitions(Mesh_ptr mesh, int *part, MSTK_Comm comm) {
 #ifdef __cplusplus
   }
 #endif
-
