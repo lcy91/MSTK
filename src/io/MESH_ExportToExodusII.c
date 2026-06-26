@@ -2185,7 +2185,12 @@ extern "C" {
             mr = owner_region[owner_gid];
           }
           if (local_elem <= 0) continue;
-          if (sparse_sideset_file && mr) {
+          /* Sparse Exodus entries already use Exodus side ordinals. Only
+           * entries rebuilt from local MSTK faces during scell expansion need
+           * conversion back to Exodus face numbering. */
+          if (sparse_sideset_file && mr &&
+              exo_export_expand_sparse_sideset(set_index,
+                                               side_set_names_glob)) {
             MRType mrtype;
             MEnt_Get_AttVal(mr,block_type_att,&mrtype,NULL,NULL);
             if ((mrtype == TET || mrtype == PRISM || mrtype == HEX) &&
