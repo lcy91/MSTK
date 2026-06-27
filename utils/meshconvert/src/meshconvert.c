@@ -20,8 +20,13 @@ https://github.com/MeshToolkit/MSTK/blob/master/LICENSE
 #endif
 
 #include "MSTK.h"
+#include "MSTK_private.h"
+#include "exodusII.h"
 
 #define MSTK_ATS_ORIG_ELEM_GID_ATT "MSTK_ATS_ORIG_ELEM_GID"
+
+extern int FixColumnPartitions_UpDownFaces(Mesh_ptr mesh, MRegion_ptr mr,
+                                           MFace_ptr *up, MFace_ptr *down);
 
 static double meshconvert_wtime(void) {
   struct timeval tv;
@@ -83,6 +88,365 @@ static void meshconvert_print_memory(const char *label, int rank, MSTK_Comm comm
     fprintf(stderr, "[meshconvert][memory] %-36s %10.1f MB\n", label, rss);
 }
 
+static const char *meshconvert_ptype_name(PType ptype) {
+  switch (ptype) {
+  case PINTERIOR: return "PINTERIOR";
+  case POVERLAP: return "POVERLAP";
+  case PBOUNDARY: return "PBOUNDARY";
+  case PGHOST: return "PGHOST";
+  default: return "UNKNOWN";
+  }
+}
+
+static int meshconvert_ats_parallel_kind(MEntity_ptr ent) {
+#ifdef MSTK_HAVE_MPI
+  return MEnt_PType(ent) == PGHOST ? 1 : 0;
+#else
+  return 0;
+#endif
+}
+
+static const char *meshconvert_ats_parallel_kind_name(int ptype) {
+  return ptype ? "GHOST" : "OWNED";
+}
+
+static int meshconvert_check_column_set(Mesh_ptr mesh, const char *setname,
+                                        int repair, int rank, MSTK_Comm comm) {
+  MSet_ptr mset;
+  MFace_ptr mf;
+  int idx = 0, local_faces = 0, local_bad = 0, local_repaired = 0;
+  int global_faces = 0, global_bad = 0, global_repaired = 0;
+
+  if (!setname || setname[0] == '\0')
+    return 1;
+
+  mset = MESH_MSetByName(mesh,setname);
+  if (!mset) {
+    if (rank == 0)
+      fprintf(stderr,
+              "[meshconvert][verify-column-set] set '%s' not found\n",
+              setname);
+    return 0;
+  }
+  if (MSet_EntDim(mset) != MFACE) {
+    if (rank == 0)
+      fprintf(stderr,
+              "[meshconvert][verify-column-set] set '%s' is not a face set\n",
+              setname);
+    return 0;
+  }
+
+  while ((mf = MSet_Next_Entry(mset,&idx))) {
+    List_ptr fregs = MF_Regions(mf);
+    MRegion_ptr mr = NULL;
+    int fptype, rptype;
+
+    local_faces++;
+    if (!fregs || List_Num_Entries(fregs) < 1) {
+      local_bad++;
+      if (local_bad == 1)
+        fprintf(stderr,
+                "[meshconvert][verify-column-set] rank %d face LID=%d GID=%d has no adjacent cell\n",
+                rank, MF_ID(mf), MF_GlobalID(mf));
+      if (fregs) List_Delete(fregs);
+      continue;
+    }
+
+    mr = List_Entry(fregs,0);
+    fptype = meshconvert_ats_parallel_kind((MEntity_ptr) mf);
+    rptype = meshconvert_ats_parallel_kind((MEntity_ptr) mr);
+    if (fptype != rptype) {
+      if (repair) {
+        MF_Set_PType(mf, MR_PType(mr));
+        local_repaired++;
+        fptype = rptype;
+      }
+    }
+    if (fptype != rptype) {
+      local_bad++;
+      if (local_bad == 1)
+        fprintf(stderr,
+                "[meshconvert][verify-column-set] rank %d set '%s' top face LID=%d GID=%d ptype=%s raw=%s first-cell LID=%d GID=%d ptype=%s raw=%s\n",
+                rank, setname, MF_ID(mf), MF_GlobalID(mf),
+                meshconvert_ats_parallel_kind_name(fptype),
+                meshconvert_ptype_name(MF_PType(mf)),
+                MR_ID(mr), MR_GlobalID(mr),
+                meshconvert_ats_parallel_kind_name(rptype),
+                meshconvert_ptype_name(MR_PType(mr)));
+      List_Delete(fregs);
+      continue;
+    }
+    List_Delete(fregs);
+
+    while (mr) {
+      MFace_ptr upf = NULL, downf = NULL;
+      MRegion_ptr next_mr = NULL;
+      List_ptr down_regs = NULL;
+      int down_ptype;
+
+      FixColumnPartitions_UpDownFaces(mesh,mr,&upf,&downf);
+      if (!downf) break;
+
+      down_ptype = meshconvert_ats_parallel_kind((MEntity_ptr) downf);
+      if (down_ptype != fptype) {
+        if (repair) {
+          if (fptype)
+            MF_Set_PType(downf, PGHOST);
+          else if (MF_PType(downf) == PGHOST)
+            MF_Set_PType(downf, POVERLAP);
+          local_repaired++;
+          down_ptype = fptype;
+        }
+      }
+      if (down_ptype != fptype) {
+        local_bad++;
+        if (local_bad == 1)
+          fprintf(stderr,
+                  "[meshconvert][verify-column-set] rank %d set '%s' down face LID=%d GID=%d ptype=%s raw=%s column-top face GID=%d ptype=%s\n",
+                  rank, setname, MF_ID(downf), MF_GlobalID(downf),
+                  meshconvert_ats_parallel_kind_name(down_ptype),
+                  meshconvert_ptype_name(MF_PType(downf)),
+                  MF_GlobalID(mf),
+                  meshconvert_ats_parallel_kind_name(fptype));
+        break;
+      }
+
+      down_regs = MF_Regions(downf);
+      if (down_regs && List_Num_Entries(down_regs) == 2) {
+        MRegion_ptr r0 = List_Entry(down_regs,0);
+        MRegion_ptr r1 = List_Entry(down_regs,1);
+        next_mr = (r0 == mr) ? r1 : r0;
+        if (next_mr &&
+            meshconvert_ats_parallel_kind((MEntity_ptr) next_mr) != fptype) {
+          local_bad++;
+          if (local_bad == 1)
+            fprintf(stderr,
+                    "[meshconvert][verify-column-set] rank %d set '%s' column cell LID=%d GID=%d ptype=%s raw=%s column-top face GID=%d ptype=%s\n",
+                    rank, setname, MR_ID(next_mr), MR_GlobalID(next_mr),
+                    meshconvert_ats_parallel_kind_name(
+                      meshconvert_ats_parallel_kind((MEntity_ptr) next_mr)),
+                    meshconvert_ptype_name(MR_PType(next_mr)),
+                    MF_GlobalID(mf),
+                    meshconvert_ats_parallel_kind_name(fptype));
+          if (down_regs) List_Delete(down_regs);
+          break;
+        }
+      }
+
+      if (down_regs) List_Delete(down_regs);
+      mr = next_mr;
+    }
+  }
+
+#ifdef MSTK_HAVE_MPI
+  if (comm) {
+    MPI_Reduce(&local_faces,&global_faces,1,MPI_INT,MPI_SUM,0,comm);
+    MPI_Reduce(&local_bad,&global_bad,1,MPI_INT,MPI_SUM,0,comm);
+    MPI_Reduce(&local_repaired,&global_repaired,1,MPI_INT,MPI_SUM,0,comm);
+  } else
+#endif
+  {
+    global_faces = local_faces;
+    global_bad = local_bad;
+    global_repaired = local_repaired;
+  }
+
+  if (rank == 0)
+    fprintf(stderr,
+            "[meshconvert][verify-column-set] set '%s' faces=%d mismatched-face-cell-ptype=%d repaired=%d\n",
+            setname, global_faces, global_bad, global_repaired);
+
+  return global_bad == 0;
+}
+
+static int meshconvert_verify_column_set(Mesh_ptr mesh, const char *setname,
+                                         int rank, MSTK_Comm comm) {
+  return meshconvert_check_column_set(mesh,setname,0,rank,comm);
+}
+
+static int meshconvert_repair_column_set(Mesh_ptr mesh, const char *setname,
+                                         int rank, MSTK_Comm comm) {
+  return meshconvert_check_column_set(mesh,setname,1,rank,comm);
+}
+
+static int meshconvert_repair_sparse_column_set(
+    Mesh_ptr mesh, const char *exo_file, const char *setname,
+    int rank, MSTK_Comm comm) {
+  MAttrib_ptr orig_gid_att;
+  MRegion_ptr mr;
+  int idx = 0, local_max_gid = 0, global_max_gid = 0;
+  int local_repaired = 0, global_repaired = 0;
+  int local_seen = 0, global_seen = 0;
+  MRegion_ptr *orig_gid_to_region = NULL;
+  int exoid, cpu_ws, io_ws, status, num_ids, target_id = -1;
+  int *ids = NULL, num_sides = 0, num_df = 0;
+  int *elem_list = NULL, *side_list = NULL;
+  float version;
+
+  if (!mesh || !exo_file || !setname || setname[0] == '\0')
+    return 1;
+
+  orig_gid_att = MESH_AttribByName(mesh,MSTK_ATS_ORIG_ELEM_GID_ATT);
+  if (!orig_gid_att) {
+    if (rank == 0)
+      fprintf(stderr,
+              "[meshconvert][repair-sparse-column-set] missing %s attribute\n",
+              MSTK_ATS_ORIG_ELEM_GID_ATT);
+    return 0;
+  }
+
+  idx = 0;
+  while ((mr = MESH_Next_Region(mesh,&idx))) {
+    int gid = 0;
+    double rval;
+    void *pval;
+    if (MR_PType(mr) == PGHOST) continue;
+    if (MEnt_Get_AttVal(mr,orig_gid_att,&gid,&rval,&pval) && gid > local_max_gid)
+      local_max_gid = gid;
+  }
+
+#ifdef MSTK_HAVE_MPI
+  if (comm)
+    MPI_Allreduce(&local_max_gid,&global_max_gid,1,MPI_INT,MPI_MAX,comm);
+  else
+#endif
+    global_max_gid = local_max_gid;
+
+  orig_gid_to_region = global_max_gid ?
+    (MRegion_ptr *) calloc(global_max_gid+1,sizeof(MRegion_ptr)) : NULL;
+  if (global_max_gid && !orig_gid_to_region)
+    MSTK_Report("meshconvert",
+                "Could not allocate sparse column repair region map",
+                MSTK_FATAL);
+
+  idx = 0;
+  while ((mr = MESH_Next_Region(mesh,&idx))) {
+    int gid = 0;
+    double rval;
+    void *pval;
+    if (MR_PType(mr) == PGHOST) continue;
+    if (MEnt_Get_AttVal(mr,orig_gid_att,&gid,&rval,&pval) &&
+        gid > 0 && gid <= global_max_gid)
+      orig_gid_to_region[gid] = mr;
+  }
+
+  cpu_ws = sizeof(double);
+  io_ws = sizeof(double);
+  exoid = ex_open(exo_file, EX_READ, &cpu_ws, &io_ws, &version);
+  if (exoid < 0) {
+    if (orig_gid_to_region) free(orig_gid_to_region);
+    MSTK_Report("meshconvert",
+                "Could not open Exodus file for sparse column repair",
+                MSTK_FATAL);
+  }
+
+  num_ids = ex_inquire_int(exoid, EX_INQ_SIDE_SETS);
+  ids = num_ids ? (int *) malloc(num_ids*sizeof(int)) : NULL;
+  if (num_ids && !ids)
+    MSTK_Report("meshconvert",
+                "Could not allocate sparse column repair side-set ids",
+                MSTK_FATAL);
+  if (num_ids) {
+    int i;
+    status = ex_get_ids(exoid, EX_SIDE_SET, ids);
+    if (status < 0)
+      MSTK_Report("meshconvert",
+                  "Could not read side-set ids for sparse column repair",
+                  MSTK_FATAL);
+    for (i = 0; i < num_ids; i++) {
+      char name[256];
+      name[0] = '\0';
+      status = ex_get_name(exoid, EX_SIDE_SET, ids[i], name);
+      if (status != 0 || name[0] == '\0')
+        sprintf(name,"sideset_%-d",ids[i]);
+      if (strcmp(name,setname) == 0) {
+        target_id = ids[i];
+        break;
+      }
+    }
+  }
+
+  if (target_id < 0) {
+    if (rank == 0)
+      fprintf(stderr,
+              "[meshconvert][repair-sparse-column-set] set '%s' not found in %s\n",
+              setname, exo_file);
+    ex_close(exoid);
+    free(ids);
+    free(orig_gid_to_region);
+    return 0;
+  }
+
+  status = ex_get_set_param(exoid, EX_SIDE_SET, target_id,
+                            &num_sides, &num_df);
+  if (status < 0)
+    MSTK_Report("meshconvert",
+                "Could not read sparse column repair side-set size",
+                MSTK_FATAL);
+
+  elem_list = num_sides ? (int *) malloc(num_sides*sizeof(int)) : NULL;
+  side_list = num_sides ? (int *) malloc(num_sides*sizeof(int)) : NULL;
+  if (num_sides && (!elem_list || !side_list))
+    MSTK_Report("meshconvert",
+                "Could not allocate sparse column repair entries",
+                MSTK_FATAL);
+
+  if (num_sides) {
+    int i;
+    status = ex_get_set(exoid, EX_SIDE_SET, target_id, elem_list, side_list);
+    if (status < 0)
+      MSTK_Report("meshconvert",
+                  "Could not read sparse column repair side-set entries",
+                  MSTK_FATAL);
+
+    for (i = 0; i < num_sides; i++) {
+      int gid = elem_list[i];
+      int side = side_list[i];
+      MFace_ptr mf = NULL;
+      List_ptr rfaces = NULL;
+      if (gid <= 0 || gid > global_max_gid) continue;
+      mr = orig_gid_to_region[gid];
+      if (!mr) continue;
+      rfaces = MR_Faces(mr);
+      if (rfaces && side > 0 && side <= List_Num_Entries(rfaces))
+        mf = List_Entry(rfaces,side-1);
+      if (rfaces) List_Delete(rfaces);
+      if (!mf) continue;
+
+      local_seen++;
+      if (meshconvert_ats_parallel_kind((MEntity_ptr) mf) !=
+          meshconvert_ats_parallel_kind((MEntity_ptr) mr)) {
+        MF_Set_PType(mf,MR_PType(mr));
+        local_repaired++;
+      }
+    }
+  }
+
+#ifdef MSTK_HAVE_MPI
+  if (comm) {
+    MPI_Reduce(&local_seen,&global_seen,1,MPI_INT,MPI_SUM,0,comm);
+    MPI_Reduce(&local_repaired,&global_repaired,1,MPI_INT,MPI_SUM,0,comm);
+  } else
+#endif
+  {
+    global_seen = local_seen;
+    global_repaired = local_repaired;
+  }
+
+  if (rank == 0)
+    fprintf(stderr,
+            "[meshconvert][repair-sparse-column-set] set '%s' entries-seen=%d repaired=%d\n",
+            setname, global_seen, global_repaired);
+
+  ex_close(exoid);
+  free(ids);
+  free(elem_list);
+  free(side_list);
+  free(orig_gid_to_region);
+
+  return 1;
+}
+
 MshFmt getFormat(char *filename) {
   int len = strlen(filename);
   if (len > 5 && strncmp(&(filename[len-5]),".mstk",5) == 0)
@@ -127,12 +491,17 @@ int main(int argc, char *argv[]) {
   int experimental_sparse_sideset_export=0;
   int experimental_ats_exo_workflow=0;
   int experimental_strict_column_partition=0;
+  int experimental_preserve_original_element_map=0;
+  char verify_column_set[256] = "";
+  char repair_column_set[256] = "";
+  char repair_sparse_column_set[256] = "";
+  char sparse_sideset_source[256] = "";
   MshFmt inmeshfmt, outmeshfmt;
   FILE *fp;
 
   if (argc < 3) {
     fprintf(stderr,"\n");
-    fprintf(stderr,"usage: meshconvert <--timing> <--experimental-skip-side-set-attrs> <--experimental-sparse-set-copy> <--experimental-batched-set-copy> <--experimental-preserve-named-sidesets> <--experimental-sparse-sideset-export> <--experimental-ats-exo-workflow> <--experimental-strict-column-partition> <--classify=0|n|1|y|2> <--partition=y|1|n|0> <--partition-method=0|1|2> <--parallel-check=y|1|n|0> <--weave=y|1|n|0> <--num-ghost-layers=?> <--check-topo=y|1|n|0> infilename outfilename\n\n");
+    fprintf(stderr,"usage: meshconvert <--timing> <--experimental-skip-side-set-attrs> <--experimental-sparse-set-copy> <--experimental-batched-set-copy> <--experimental-preserve-named-sidesets> <--experimental-sparse-sideset-export> <--experimental-sparse-sideset-source=file> <--experimental-ats-exo-workflow> <--experimental-strict-column-partition> <--experimental-preserve-original-element-map> <--verify-column-set=name> <--repair-column-set=name> <--experimental-repair-sparse-column-set=name> <--classify=0|n|1|y|2> <--partition=y|1|n|0> <--partition-method=0|1|2> <--parallel-check=y|1|n|0> <--weave=y|1|n|0> <--num-ghost-layers=?> <--check-topo=y|1|n|0> infilename outfilename\n\n");
     fprintf(stderr,"partition-method = 0, METIS\n");
     fprintf(stderr,"                 = 1, ZOLTAN with GRAPH partioning\n");
     fprintf(stderr,"                 = 2, ZOLTAN with RCB partitioning\n");
@@ -209,12 +578,36 @@ int main(int argc, char *argv[]) {
         setenv("MSTK_SPARSE_SIDESET_EXPORT", "1", 1);
         setenv("MSTK_SKIP_SIDE_SET_ATTR_COPY", "1", 1);
       }
+      else if (strncmp(argv[i],"--experimental-sparse-sideset-source=",37) == 0) {
+        experimental_sparse_sideset_export = 1;
+        strncpy(sparse_sideset_source, argv[i]+37,
+                sizeof(sparse_sideset_source)-1);
+        sparse_sideset_source[sizeof(sparse_sideset_source)-1] = '\0';
+        setenv("MSTK_SPARSE_SIDESET_EXPORT", "1", 1);
+        setenv("MSTK_SKIP_SIDE_SET_ATTR_COPY", "1", 1);
+      }
       else if (strncmp(argv[i],"--experimental-ats-exo-workflow",31) == 0) {
         experimental_ats_exo_workflow = 1;
       }
       else if (strncmp(argv[i],"--experimental-strict-column-partition",38) == 0) {
         experimental_strict_column_partition = 1;
         setenv("MSTK_STRICT_COLUMN_PARTITION", "1", 1);
+      }
+      else if (strncmp(argv[i],"--experimental-preserve-original-element-map",44) == 0) {
+        experimental_preserve_original_element_map = 1;
+      }
+      else if (strncmp(argv[i],"--verify-column-set=",20) == 0) {
+        strncpy(verify_column_set, argv[i]+20, sizeof(verify_column_set)-1);
+        verify_column_set[sizeof(verify_column_set)-1] = '\0';
+      }
+      else if (strncmp(argv[i],"--repair-column-set=",20) == 0) {
+        strncpy(repair_column_set, argv[i]+20, sizeof(repair_column_set)-1);
+        repair_column_set[sizeof(repair_column_set)-1] = '\0';
+      }
+      else if (strncmp(argv[i],"--experimental-repair-sparse-column-set=",40) == 0) {
+        strncpy(repair_sparse_column_set, argv[i]+40,
+                sizeof(repair_sparse_column_set)-1);
+        repair_sparse_column_set[sizeof(repair_sparse_column_set)-1] = '\0';
       }
       else if (strncmp(argv[i],"--classify",10) == 0) {
         if (strncmp(argv[i]+11,"y",1) == 0 ||
@@ -378,15 +771,36 @@ int main(int argc, char *argv[]) {
     if (experimental_sparse_sideset_export)
       fprintf(stderr,
               "[meshconvert][timing] experimental-sparse-sideset-export enabled\n");
+    if (sparse_sideset_source[0] != '\0')
+      fprintf(stderr,
+              "[meshconvert][timing] experimental-sparse-sideset-source=%s\n",
+              sparse_sideset_source);
     if (experimental_ats_exo_workflow)
       fprintf(stderr,
               "[meshconvert][timing] experimental-ats-exo-workflow enabled\n");
     if (experimental_strict_column_partition)
       fprintf(stderr,
               "[meshconvert][timing] experimental-strict-column-partition enabled\n");
+    if (experimental_preserve_original_element_map)
+      fprintf(stderr,
+              "[meshconvert][timing] experimental-preserve-original-element-map enabled\n");
+    if (verify_column_set[0] != '\0')
+      fprintf(stderr,
+              "[meshconvert][timing] verify-column-set=%s\n",
+              verify_column_set);
+    if (repair_column_set[0] != '\0')
+      fprintf(stderr,
+              "[meshconvert][timing] repair-column-set=%s\n",
+              repair_column_set);
+    if (repair_sparse_column_set[0] != '\0')
+      fprintf(stderr,
+              "[meshconvert][timing] experimental-repair-sparse-column-set=%s\n",
+              repair_sparse_column_set);
   }
 
-  if (experimental_sparse_sideset_export && inmeshfmt == EXODUSII)
+  if (sparse_sideset_source[0] != '\0')
+    setenv("MSTK_SPARSE_SIDESET_EXPORT_FILE", sparse_sideset_source, 1);
+  else if (experimental_sparse_sideset_export && inmeshfmt == EXODUSII)
     setenv("MSTK_SPARSE_SIDESET_EXPORT_FILE", infname, 1);
 
   /* now read the mesh */
@@ -464,6 +878,9 @@ int main(int argc, char *argv[]) {
 
           setenv("MSTK_SPARSE_SIDESET_OWNER_ATTR",
                  MSTK_ATS_ORIG_ELEM_GID_ATT,1);
+          if (experimental_preserve_original_element_map)
+            setenv("MSTK_EXODUS_ELEM_MAP_ATTR",
+                   MSTK_ATS_ORIG_ELEM_GID_ATT,1);
         }
 
         double gid_t0 = meshconvert_wtime();
@@ -774,7 +1191,45 @@ int main(int argc, char *argv[]) {
 
   }  /* if (serial_file) {...} else {...} */
 
-    
+  if (repair_column_set[0] != '\0') {
+    double repair_t0 = meshconvert_wtime();
+    ok = meshconvert_repair_column_set(mesh, repair_column_set, rank, comm);
+    double repair_t1 = meshconvert_wtime();
+    if (timing)
+      meshconvert_print_time("repair-column-set", repair_t0, repair_t1,
+                             rank, comm);
+    if (!ok)
+      MSTK_Report("meshconvert",
+                  "Column-set repair failed", MSTK_FATAL);
+  }
+
+  if (repair_sparse_column_set[0] != '\0') {
+    const char *repair_source = sparse_sideset_source[0] != '\0' ?
+      sparse_sideset_source : infname;
+    double repair_t0 = meshconvert_wtime();
+    ok = meshconvert_repair_sparse_column_set(mesh, repair_source,
+                                              repair_sparse_column_set,
+                                              rank, comm);
+    double repair_t1 = meshconvert_wtime();
+    if (timing)
+      meshconvert_print_time("repair-sparse-column-set", repair_t0, repair_t1,
+                             rank, comm);
+    if (!ok)
+      MSTK_Report("meshconvert",
+                  "Sparse column-set repair failed", MSTK_FATAL);
+  }
+
+  if (verify_column_set[0] != '\0') {
+    double verify_t0 = meshconvert_wtime();
+    ok = meshconvert_verify_column_set(mesh, verify_column_set, rank, comm);
+    double verify_t1 = meshconvert_wtime();
+    if (timing)
+      meshconvert_print_time("verify-column-set", verify_t0, verify_t1,
+                             rank, comm);
+    if (!ok)
+      MSTK_Report("meshconvert",
+                  "Column-set verification failed", MSTK_FATAL);
+  }
 
     
 

@@ -31,11 +31,23 @@ extern "C" {
   }
 
   static int partition_send_skip_side_set_attr_copy(void) {
+    const char *fast = getenv("MSTK_FAST_SET_COPY");
+    if (fast && fast[0] != '\0' && fast[0] != '0')
+      return 1;
+    fast = getenv("MSTK_ATS_FAST_EXO_SETS");
+    if (fast && fast[0] != '\0' && fast[0] != '0')
+      return 1;
     const char *val = getenv("MSTK_SKIP_SIDE_SET_ATTR_COPY");
     return (val && val[0] != '\0' && val[0] != '0');
   }
 
   static int partition_send_batched_set_copy(void) {
+    const char *fast = getenv("MSTK_FAST_SET_COPY");
+    if (fast && fast[0] != '\0' && fast[0] != '0')
+      return 1;
+    fast = getenv("MSTK_ATS_FAST_EXO_SETS");
+    if (fast && fast[0] != '\0' && fast[0] != '0')
+      return 1;
     const char *val = getenv("MSTK_BATCHED_SET_COPY");
     return (val && val[0] != '\0' && val[0] != '0');
   }
@@ -43,6 +55,40 @@ extern "C" {
   static int partition_send_sparse_sideset_export(void) {
     const char *val = getenv("MSTK_SPARSE_SIDESET_EXPORT");
     return (val && val[0] != '\0' && val[0] != '0');
+  }
+
+  static const char *partition_send_attr_type_name(int atttype) {
+    switch (atttype) {
+    case INT:
+      return "INT";
+    case DOUBLE:
+      return "DOUBLE";
+    case VECTOR:
+      return "VECTOR";
+    case TENSOR:
+      return "TENSOR";
+    case POINTER:
+      return "POINTER";
+    default:
+      return "UNKNOWN";
+    }
+  }
+
+  static const char *partition_send_mtype_name(MType mtype) {
+    switch (mtype) {
+    case MVERTEX:
+      return "VERTEX";
+    case MEDGE:
+      return "EDGE";
+    case MFACE:
+      return "FACE";
+    case MREGION:
+      return "REGION";
+    case MALLTYPE:
+      return "ALL";
+    default:
+      return "UNKNOWN";
+    }
   }
 
   static int MESH_CopySets_Batched(Mesh_ptr parentmesh, int num,
@@ -54,12 +100,6 @@ extern "C" {
       MSTK_Report("MESH_CopySets_Batched",
                   "Missing Global2Local attribute", MSTK_FATAL);
 
-    MSet_ptr *local_sets =
-      (MSet_ptr *) calloc(((size_t) nset_global)*num, sizeof(MSet_ptr));
-    if (!local_sets)
-      MSTK_Report("MESH_CopySets_Batched",
-                  "Could not allocate local set lookup table", MSTK_FATAL);
-
     long long total_entries = 0;
     long long total_local_entries = 0;
     double t0 = MPI_Wtime();
@@ -68,7 +108,14 @@ extern "C" {
       MSet_ptr gmset = MESH_MSet(parentmesh,msetids[m]);
       MType mtype = MSet_EntDim(gmset);
       MEntity_ptr gment, lment;
+      MSet_ptr *local_sets;
       int idx = 0;
+
+      local_sets = (MSet_ptr *) calloc(num, sizeof(MSet_ptr));
+      if (!local_sets)
+        MSTK_Report("MESH_CopySets_Batched",
+                    "Could not allocate per-set local lookup table",
+                    MSTK_FATAL);
 
       while ((gment = MSet_Next_Entry(gmset,&idx))) {
         List_ptr lmentlist;
@@ -82,13 +129,12 @@ extern "C" {
 
           for (int i = 0; i < num; ++i) {
             if (submesh == submeshes[i]) {
-              size_t loc = ((size_t) m)*num + i;
-              MSet_ptr lmset = local_sets[loc];
+              MSet_ptr lmset = local_sets[i];
               if (!lmset) {
                 lmset = MESH_MSetByName(submeshes[i],msetnames[m]);
                 if (!lmset)
                   lmset = MSet_New(submeshes[i],msetnames[m],mtype);
-                local_sets[loc] = lmset;
+                local_sets[i] = lmset;
               }
               MSet_Add(lmset,lment);
               total_local_entries++;
@@ -97,6 +143,8 @@ extern "C" {
           }
         }
       }
+
+      free(local_sets);
 
       if (timing && rank == 0 && (m+1)%10000 == 0)
         fprintf(stderr,
@@ -109,7 +157,6 @@ extern "C" {
               "[meshconvert][timing] rank0 batched set copy stats global_entries=%lld local_entries=%lld\n",
               total_entries, total_local_entries);
 
-    free(local_sets);
     return 1;
   }
 
@@ -331,9 +378,17 @@ extern "C" {
       char (*attnames)[256] = 
         (char (*)[256]) malloc(natt_global*sizeof(char [256]));
       MType side_dim = MESH_Num_Regions(parentmesh) ? MFACE : MEDGE;
+      int copied_attrs = 0, copied_side_int_attrs = 0;
+      int copied_vertex_attrs = 0, copied_edge_attrs = 0;
+      int copied_face_attrs = 0, copied_region_attrs = 0, copied_all_attrs = 0;
+      double side_int_attr_time = 0.0;
+      double last_attr_progress_time;
 
       t0 = MPI_Wtime();
+      last_attr_progress_time = t0;
       for (a = 0; a < natt_global; a++) {
+        double attr_t0, attr_t1;
+        MType attdim;
         attrib = MESH_Attrib(parentmesh,a);          
 
         MAttrib_Get_Name(attrib,attnames[a]);
@@ -341,19 +396,67 @@ extern "C" {
 
         atttype = MAttrib_Get_Type(attrib);
         if (atttype == POINTER) continue;
+        attdim = MAttrib_Get_EntDim(attrib);
         if (skip_side_set_attrs && atttype == INT &&
-            MAttrib_Get_EntDim(attrib) == side_dim &&
+            attdim == side_dim &&
             (sparse_sideset_export ||
              strncmp(attnames[a],"sideset_",8) != 0)) {
           skipped_side_set_attrs++;
           continue;
         }
-          
+
+        attr_t0 = MPI_Wtime();
         MESH_CopyAttr(parentmesh,num,submeshes,attnames[a]);
+        attr_t1 = MPI_Wtime();
+        copied_attrs++;
+        if (atttype == INT && attdim == side_dim) {
+          copied_side_int_attrs++;
+          side_int_attr_time += attr_t1 - attr_t0;
+        }
+        switch (attdim) {
+        case MVERTEX:
+          copied_vertex_attrs++;
+          break;
+        case MEDGE:
+          copied_edge_attrs++;
+          break;
+        case MFACE:
+          copied_face_attrs++;
+          break;
+        case MREGION:
+          copied_region_attrs++;
+          break;
+        case MALLTYPE:
+          copied_all_attrs++;
+          break;
+        default:
+          break;
+        }
+        if (timing && rank == 0 && attr_t1 - last_attr_progress_time > 10.0) {
+          fprintf(stderr,
+                  "[meshconvert][timing] rank0 copy attribute progress "
+                  "attr=%d/%d copied=%d side-dim-INT=%d elapsed=%10.3f s "
+                  "last=%s dim=%s type=%s last-time=%10.3f s\n",
+                  a+1, natt_global, copied_attrs, copied_side_int_attrs,
+                  attr_t1 - t0, attnames[a],
+                  partition_send_mtype_name(attdim),
+                  partition_send_attr_type_name(atttype),
+                  attr_t1 - attr_t0);
+          fflush(stderr);
+          last_attr_progress_time = attr_t1;
+        }
       }        
       t1 = MPI_Wtime();
       if (timing) {
         partition_send_print_time("rank0 copy attributes", t0, t1, rank);
+        if (rank == 0)
+          fprintf(stderr,
+                  "[meshconvert][timing] rank0 copy attribute counts "
+                  "total=%d vertex=%d edge=%d face=%d region=%d all=%d "
+                  "side-dim-INT=%d side-dim-INT-time=%10.3f s\n",
+                  copied_attrs, copied_vertex_attrs, copied_edge_attrs,
+                  copied_face_attrs, copied_region_attrs, copied_all_attrs,
+                  copied_side_int_attrs, side_int_attr_time);
         if (skip_side_set_attrs && rank == 0)
           fprintf(stderr,
                   "[meshconvert][timing] skipped side-dim INT attrs=%d\n",
@@ -390,23 +493,28 @@ extern "C" {
       /* Send each attribute to the various processors */
 
       t0 = MPI_Wtime();
+      last_attr_progress_time = t0;
       for (a = 0; a < natt_global; a++) {
-          
+        double attr_send_t0, attr_send_t1;
+        int attr_sends = 0;
+
+        attr_send_t0 = MPI_Wtime();
         for (n = 0; n < num; n++) {
           torank = toranks[n];
           if (torank == rank) continue;
-            
+
           attrib = MESH_AttribByName(submeshes[torank],attnames[a]);
           if (!attrib) continue; /* this attribute does not exist on this  */
           /* processor - right now its not possible */
           /* but it might be in the future          */
             
           if (MAttrib_Get_Type(attrib) == POINTER) continue;
-            
+
           MESH_Send_Attribute(submeshes[torank], attrib, torank, comm,
                               &numreq, &maxreq, &requests,
                               &numptrs2free, &maxptrs2free, &ptrs2free);
-            
+          attr_sends++;
+
           if (numreq > maxpendreq) {
             if (MPI_Waitall(numreq,requests,MPI_STATUSES_IGNORE) != MPI_SUCCESS)
               MSTK_Report("MSTK_Mesh_Distribute","Could not send mesh",MSTK_FATAL);
@@ -416,6 +524,17 @@ extern "C" {
               numptrs2free = 0;
             }
           }	
+        }
+        attr_send_t1 = MPI_Wtime();
+        if (timing && rank == 0 && attr_send_t1 - last_attr_progress_time > 10.0) {
+          fprintf(stderr,
+                  "[meshconvert][timing] rank0 send attribute progress "
+                  "attr=%d/%d sends=%d elapsed=%10.3f s "
+                  "last=%s last-time=%10.3f s\n",
+                  a+1, natt_global, attr_sends, attr_send_t1 - t0,
+                  attnames[a], attr_send_t1 - attr_send_t0);
+          fflush(stderr);
+          last_attr_progress_time = attr_send_t1;
         }
       }
       t1 = MPI_Wtime();

@@ -18,6 +18,65 @@ https://github.com/MeshToolkit/MSTK/blob/master/LICENSE
 extern "C" {
 #endif
 
+  static int MSTK_RepairBoundarySideSetPTypes(Mesh_ptr mesh, int rank,
+                                              MSTK_Comm comm) {
+    int idx = 0, local_repaired = 0, global_repaired = 0;
+    MSet_ptr mset;
+
+    while ((mset = MESH_Next_MSet(mesh,&idx))) {
+      int eidx = 0;
+      MFace_ptr mf;
+
+      if (MSet_EntDim(mset) != MFACE) continue;
+
+      while ((mf = MSet_Next_Entry(mset,&eidx))) {
+        List_ptr fregs;
+        MRegion_ptr mr;
+
+        if (MF_PType(mf) != PGHOST) continue;
+
+        fregs = MF_Regions(mf);
+        if (!fregs || List_Num_Entries(fregs) < 1) {
+          if (fregs) List_Delete(fregs);
+          continue;
+        }
+
+        for (int i = 0; i < List_Num_Entries(fregs); i++) {
+          mr = List_Entry(fregs,i);
+          if (mr && MR_PType(mr) != PGHOST) {
+            MF_Set_PType(mf,MR_PType(mr));
+            local_repaired++;
+            break;
+          }
+        }
+        List_Delete(fregs);
+      }
+    }
+
+#ifdef MSTK_HAVE_MPI
+    if (comm)
+      MPI_Allreduce(&local_repaired,&global_repaired,1,MPI_INT,MPI_SUM,comm);
+    else
+#endif
+      global_repaired = local_repaired;
+
+    if (global_repaired) {
+      char mesg[256];
+      sprintf(mesg,
+              "Repaired %-d boundary side-set face ptypes after weaving",
+              global_repaired);
+      if (rank == 0)
+        MSTK_Report("MSTK_Weave_DistributedMeshes",mesg,MSTK_MESG);
+    }
+
+    return global_repaired;
+  }
+
+  static int MSTK_DisableBoundarySideSetPTypeRepair(void) {
+    const char *val = getenv("MSTK_DISABLE_BOUNDARY_SIDESET_PTYPE_REPAIR");
+    return val && val[0] != '\0' && val[0] != '0';
+  }
+
 
 
   /* Weave a set of distributed mesh partitions together to build the
@@ -88,6 +147,9 @@ extern "C" {
                                              
 
     MESH_Update_ParallelAdj(mesh, comm);
+    if (!MSTK_DisableBoundarySideSetPTypeRepair() &&
+        MSTK_RepairBoundarySideSetPTypes(mesh, rank, comm))
+      MESH_Build_GhostLists(mesh, topodim);
     return 1;
   }
 
@@ -95,4 +157,3 @@ extern "C" {
 #ifdef __cplusplus
 }
 #endif
-

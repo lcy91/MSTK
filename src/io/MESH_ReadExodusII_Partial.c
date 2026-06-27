@@ -1573,6 +1573,20 @@ extern "C" {
 	    List_ptr rfaces = MR_Faces(mr);
 	    MFace_ptr mf = List_Entry(rfaces,ss_side_list[j]-1);
 	    List_Delete(rfaces);
+
+            /* Nemesis import can leave a boundary side-set face as PGHOST
+             * even when the local side-set element/cell is owned or overlap.
+             * ATS column construction treats all non-PGHOST entities as
+             * owned and requires the column top face to have the same
+             * owned/ghost kind as the adjacent cell.  For boundary side-set
+             * faces with only this local region, match the face ptype to the
+             * cell ptype. */
+            if (mf && mr && MF_PType(mf) == PGHOST && MR_PType(mr) != PGHOST) {
+              List_ptr fregs = MF_Regions(mf);
+              if (fregs && List_Num_Entries(fregs) == 1)
+                MF_Set_PType(mf,MR_PType(mr));
+              if (fregs) List_Delete(fregs);
+            }
 	      
 	    /* Set attribute value for this edge */
 	    MEnt_Set_AttVal(mf,sidesetatt,sideset_ids[i],0.0,NULL);

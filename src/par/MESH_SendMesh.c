@@ -19,6 +19,12 @@ extern "C" {
 #endif
 
   static int sendmesh_batched_set_copy(void) {
+    const char *fast = getenv("MSTK_FAST_SET_COPY");
+    if (fast && fast[0] != '\0' && fast[0] != '0')
+      return 1;
+    fast = getenv("MSTK_ATS_FAST_EXO_SETS");
+    if (fast && fast[0] != '\0' && fast[0] != '0')
+      return 1;
     const char *val = getenv("MSTK_BATCHED_SET_COPY");
     return (val && val[0] != '\0' && val[0] != '0');
   }

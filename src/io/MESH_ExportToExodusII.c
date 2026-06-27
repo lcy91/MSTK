@@ -10,6 +10,7 @@ https://github.com/MeshToolkit/MSTK/blob/master/LICENSE
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <limits.h>
 #include <time.h>
 #include <sys/time.h>
 
@@ -1736,6 +1737,10 @@ extern "C" {
         int local_owned = 0, local_max_gid = 0, global_max_gid = 0;
         int *local_gids = NULL, *recv_counts = NULL, *recv_displs = NULL;
         int *all_gids = NULL, *owner_rank = NULL, *owner_local_elem = NULL;
+        int *all_priorities = NULL, *local_priorities = NULL;
+        int *owner_priority = NULL;
+        int max_side_ordinal = 8;
+        int *side_owner_code = NULL;
         MRegion_ptr *owner_region = NULL;
         int *send_counts = NULL, *recv_counts_int = NULL;
         int *send_displs = NULL, *recv_displs_int = NULL;
@@ -1755,9 +1760,15 @@ extern "C" {
 
         local_gids = local_owned ?
           (int *) malloc(local_owned*sizeof(int)) : NULL;
+        local_priorities = local_owned ?
+          (int *) malloc(local_owned*sizeof(int)) : NULL;
         if (local_owned && !local_gids)
           MSTK_Report("MESH_ExportToExodusII",
                       "Could not allocate local element id list",
+                      MSTK_FATAL);
+        if (local_owned && !local_priorities)
+          MSTK_Report("MESH_ExportToExodusII",
+                      "Could not allocate local element priority list",
                       MSTK_FATAL);
 
         idx = 0; j = 0;
@@ -1765,6 +1776,7 @@ extern "C" {
           if (MR_PType(mr) == PGHOST) continue;
           local_gids[j++] = exo_export_region_owner_key(mr,
                                                         sparse_owner_att);
+          local_priorities[j-1] = (MR_PType(mr) == PINTERIOR) ? 2 : 1;
         }
 
         MPI_Allreduce(&local_max_gid,&global_max_gid,1,MPI_INT,MPI_MAX,comm);
@@ -1772,7 +1784,9 @@ extern "C" {
         owner_local_elem = (int *) calloc(global_max_gid+1,sizeof(int));
         owner_region = (MRegion_ptr *) calloc(global_max_gid+1,
                                               sizeof(MRegion_ptr));
-        if (!owner_rank || !owner_local_elem || !owner_region)
+        owner_priority = (int *) calloc(global_max_gid+1,sizeof(int));
+        if (!owner_rank || !owner_local_elem || !owner_region ||
+            !owner_priority)
           MSTK_Report("MESH_ExportToExodusII",
                       "Could not allocate element owner map",
                       MSTK_FATAL);
@@ -1803,18 +1817,72 @@ extern "C" {
         }
         all_gids = total_recv_gid ?
           (int *) malloc(total_recv_gid*sizeof(int)) : NULL;
+        all_priorities = total_recv_gid ?
+          (int *) malloc(total_recv_gid*sizeof(int)) : NULL;
         if (total_recv_gid && !all_gids)
           MSTK_Report("MESH_ExportToExodusII",
                       "Could not allocate element owner gather buffer",
                       MSTK_FATAL);
+        if (total_recv_gid && !all_priorities)
+          MSTK_Report("MESH_ExportToExodusII",
+                      "Could not allocate element owner priority buffer",
+                      MSTK_FATAL);
         MPI_Allgatherv(local_gids,local_owned,MPI_INT,
                        all_gids,recv_counts,recv_displs,MPI_INT,comm);
+        MPI_Allgatherv(local_priorities,local_owned,MPI_INT,
+                       all_priorities,recv_counts,recv_displs,MPI_INT,comm);
         for (i = 0; i < numprocs; i++) {
           for (j = 0; j < recv_counts[i]; j++) {
             int gid = all_gids[recv_displs[i]+j];
-            if (gid > 0 && gid <= global_max_gid)
+            int priority = all_priorities[recv_displs[i]+j];
+            if (gid > 0 && gid <= global_max_gid &&
+                priority >= owner_priority[gid]) {
               owner_rank[gid] = i;
+              owner_priority[gid] = priority;
+            }
           }
+        }
+
+        if (global_max_gid > 0) {
+          size_t nside_owner =
+            ((size_t) global_max_gid + 1) * (size_t) max_side_ordinal;
+          if (nside_owner > INT_MAX)
+            MSTK_Report("MESH_ExportToExodusII",
+                        "Sparse side-specific owner map is too large",
+                        MSTK_FATAL);
+          side_owner_code = (int *) calloc(nside_owner,sizeof(int));
+          if (!side_owner_code)
+            MSTK_Report("MESH_ExportToExodusII",
+                        "Could not allocate sparse side-specific owner map",
+                        MSTK_FATAL);
+
+          idx = 0;
+          while ((mr = MESH_Next_Region(mesh,&idx))) {
+            int owner_key, priority, code;
+            List_ptr rfaces;
+            if (MR_PType(mr) == PGHOST) continue;
+            owner_key = exo_export_region_owner_key(mr,sparse_owner_att);
+            if (owner_key <= 0 || owner_key > global_max_gid) continue;
+            priority = (MR_PType(mr) == PINTERIOR) ? 2 : 1;
+            code = priority*(numprocs+1) + rank + 1;
+            rfaces = MR_Faces(mr);
+            if (rfaces) {
+              int nf = List_Num_Entries(rfaces);
+              int side;
+              for (side = 1; side <= nf && side < max_side_ordinal; side++) {
+                MFace_ptr side_face = List_Entry(rfaces,side-1);
+                size_t map_index =
+                  ((size_t) owner_key)*max_side_ordinal + side;
+                if (side_face && MF_PType(side_face) != PGHOST &&
+                    code > side_owner_code[map_index])
+                  side_owner_code[map_index] = code;
+              }
+              List_Delete(rfaces);
+            }
+          }
+
+          MPI_Allreduce(MPI_IN_PLACE,side_owner_code,(int) nside_owner,
+                        MPI_INT,MPI_MAX,comm);
         }
 
         send_counts = (int *) calloc(numprocs,sizeof(int));
@@ -1860,13 +1928,21 @@ extern "C" {
                 MSTK_Report("MESH_ExportToExodusII",
                             "Could not read sparse side-set entries",
                             MSTK_FATAL);
-              for (j = 0; j < num_sides_in_set; j++) {
-                int owner_gid = ss_elem_list[j];
-                int dest;
-                if (owner_gid <= 0 || owner_gid > global_max_gid) continue;
-                dest = owner_rank[owner_gid];
-                if (dest >= 0) send_counts[dest] += 3;
-              }
+	              for (j = 0; j < num_sides_in_set; j++) {
+	                int owner_gid = ss_elem_list[j];
+	                int side_ordinal = ss_side_list[j];
+	                int dest, code = 0;
+	                if (owner_gid <= 0 || owner_gid > global_max_gid) continue;
+	                dest = owner_rank[owner_gid];
+	                if (side_owner_code && side_ordinal > 0 &&
+	                    side_ordinal < max_side_ordinal) {
+	                  code = side_owner_code[((size_t) owner_gid)*
+	                                         max_side_ordinal + side_ordinal];
+	                  if (code > 0)
+	                    dest = (code % (numprocs+1)) - 1;
+	                }
+	                if (dest >= 0) send_counts[dest] += 3;
+	              }
               free(ss_elem_list);
               free(ss_side_list);
             }
@@ -1947,14 +2023,21 @@ extern "C" {
                 MSTK_Report("MESH_ExportToExodusII",
                             "Could not read sparse side-set entries",
                             MSTK_FATAL);
-              for (j = 0; j < num_sides_in_set; j++) {
-                int owner_gid = ss_elem_list[j];
-                int side_ordinal = ss_side_list[j];
-                int dest, pos;
-                if (owner_gid <= 0 || owner_gid > global_max_gid) continue;
-                dest = owner_rank[owner_gid];
-                if (dest < 0) continue;
-                pos = send_pos[dest];
+	              for (j = 0; j < num_sides_in_set; j++) {
+	                int owner_gid = ss_elem_list[j];
+	                int side_ordinal = ss_side_list[j];
+	                int dest, pos, code = 0;
+	                if (owner_gid <= 0 || owner_gid > global_max_gid) continue;
+	                dest = owner_rank[owner_gid];
+	                if (side_owner_code && side_ordinal > 0 &&
+	                    side_ordinal < max_side_ordinal) {
+	                  code = side_owner_code[((size_t) owner_gid)*
+	                                         max_side_ordinal + side_ordinal];
+	                  if (code > 0)
+	                    dest = (code % (numprocs+1)) - 1;
+	                }
+	                if (dest < 0) continue;
+	                pos = send_pos[dest];
                 sendbuf[pos] = i;
                 sendbuf[pos+1] = owner_gid;
                 sendbuf[pos+2] = side_ordinal;
@@ -2017,6 +2100,14 @@ extern "C" {
             if (!exo_export_expand_sparse_sideset(set_index,
                                                   side_set_names_glob)) {
               int dest = owner_rank[owner_gid];
+              int code = 0;
+              if (side_owner_code && exo_side > 0 &&
+                  exo_side < max_side_ordinal) {
+                code = side_owner_code[((size_t) owner_gid)*max_side_ordinal +
+                                       exo_side];
+                if (code > 0)
+                  dest = (code % (numprocs+1)) - 1;
+              }
               if (dest >= 0) exp_send_counts[dest] += 3;
               continue;
             }
@@ -2027,6 +2118,14 @@ extern "C" {
                                                    element_set_names_glob);
             if (target_set_index < 0) {
               int dest = owner_rank[owner_gid];
+              int code = 0;
+              if (side_owner_code && exo_side > 0 &&
+                  exo_side < max_side_ordinal) {
+                code = side_owner_code[((size_t) owner_gid)*max_side_ordinal +
+                                       exo_side];
+                if (code > 0)
+                  dest = (code % (numprocs+1)) - 1;
+              }
               if (dest >= 0) exp_send_counts[dest] += 3;
               continue;
             }
@@ -2041,14 +2140,24 @@ extern "C" {
             fregs = MF_Regions(side_face);
             nfregs = fregs ? List_Num_Entries(fregs) : 0;
             for (k = 0; k < nfregs; k++) {
-              MRegion_ptr adj_mr = List_Entry(fregs,k);
-              int target_gid = exo_export_region_owner_key(adj_mr,
-                                                           sparse_owner_att);
-              int dest;
-              if (!MSet_Contains(element_sets_glob[target_set_index],adj_mr))
-                continue;
-              if (target_gid <= 0 || target_gid > global_max_gid) continue;
-              dest = owner_rank[target_gid];
+	              MRegion_ptr adj_mr = List_Entry(fregs,k);
+	              int target_gid = exo_export_region_owner_key(adj_mr,
+	                                                           sparse_owner_att);
+	              int dest;
+	              int target_side = MF_LocalID_in_Region(side_face,adj_mr) + 1;
+	              int code = 0;
+	              if (!MSet_Contains(element_sets_glob[target_set_index],adj_mr))
+	                continue;
+	              if (target_gid <= 0 || target_gid > global_max_gid) continue;
+	              if (target_side <= 0) continue;
+	              dest = owner_rank[target_gid];
+	              if (side_owner_code && target_side > 0 &&
+	                  target_side < max_side_ordinal) {
+	                code = side_owner_code[((size_t) target_gid)*max_side_ordinal +
+	                                       target_side];
+	                if (code > 0)
+	                  dest = (code % (numprocs+1)) - 1;
+	              }
               if (dest >= 0) exp_send_counts[dest] += 3;
             }
             if (fregs) List_Delete(fregs);
@@ -2096,7 +2205,14 @@ extern "C" {
             if (!exo_export_expand_sparse_sideset(set_index,
                                                   side_set_names_glob)) {
               int dest = owner_rank[owner_gid];
-              int pos;
+              int pos, code = 0;
+              if (side_owner_code && exo_side > 0 &&
+                  exo_side < max_side_ordinal) {
+                code = side_owner_code[((size_t) owner_gid)*max_side_ordinal +
+                                       exo_side];
+                if (code > 0)
+                  dest = (code % (numprocs+1)) - 1;
+              }
               if (dest < 0) continue;
               pos = exp_send_pos[dest];
               exp_sendbuf[pos] = set_index;
@@ -2112,7 +2228,14 @@ extern "C" {
                                                    element_set_names_glob);
             if (target_set_index < 0) {
               int dest = owner_rank[owner_gid];
-              int pos;
+              int pos, code = 0;
+              if (side_owner_code && exo_side > 0 &&
+                  exo_side < max_side_ordinal) {
+                code = side_owner_code[((size_t) owner_gid)*max_side_ordinal +
+                                       exo_side];
+                if (code > 0)
+                  dest = (code % (numprocs+1)) - 1;
+              }
               if (dest < 0) continue;
               pos = exp_send_pos[dest];
               exp_sendbuf[pos] = set_index;
@@ -2136,12 +2259,19 @@ extern "C" {
               int target_gid = exo_export_region_owner_key(adj_mr,
                                                            sparse_owner_att);
               int target_side = MF_LocalID_in_Region(side_face,adj_mr) + 1;
-              int dest, pos;
+              int dest, pos, code = 0;
               if (!MSet_Contains(element_sets_glob[target_set_index],adj_mr))
                 continue;
               if (target_gid <= 0 || target_gid > global_max_gid) continue;
               if (target_side <= 0) continue;
               dest = owner_rank[target_gid];
+              if (side_owner_code && target_side > 0 &&
+                  target_side < max_side_ordinal) {
+                code = side_owner_code[((size_t) target_gid)*max_side_ordinal +
+                                       target_side];
+                if (code > 0)
+                  dest = (code % (numprocs+1)) - 1;
+              }
               if (dest < 0) continue;
               pos = exp_send_pos[dest];
               exp_sendbuf[pos] = set_index;
@@ -2206,12 +2336,16 @@ extern "C" {
             exo_export_raw_list_unique(&raw_side_lists[i]);
 
         free(local_gids);
+        free(local_priorities);
         free(recv_counts);
         free(recv_displs);
         free(all_gids);
+        free(all_priorities);
         free(owner_rank);
         free(owner_local_elem);
         free(owner_region);
+        free(owner_priority);
+        free(side_owner_code);
         free(send_counts);
         free(recv_counts_int);
         free(send_displs);
@@ -2727,6 +2861,11 @@ extern "C" {
       /* Write out element map (global IDs of elements) */
 
       int *elem_map;
+      const char *elem_map_attr_name = getenv("MSTK_EXODUS_ELEM_MAP_ATTR");
+      MAttrib_ptr elem_map_attr = NULL;
+
+      if (elem_map_attr_name && elem_map_attr_name[0] != '\0')
+        elem_map_attr = MESH_AttribByName(mesh,elem_map_attr_name);
 
       if (nrowned) {
         elem_map = (int *) calloc(nrowned,sizeof(int));
@@ -2734,8 +2873,20 @@ extern "C" {
           idx = 0;
           while ((mr = MSet_Next_Entry(element_blocks_glob[i],&idx))) {
             int local_elem_id = elem_id[MR_ID(mr)-1];
-            if (local_elem_id > 0 && local_elem_id <= nrowned)
-              elem_map[local_elem_id-1] = MR_GlobalID(mr);
+            if (local_elem_id > 0 && local_elem_id <= nrowned) {
+              int map_id = MR_GlobalID(mr);
+              if (elem_map_attr &&
+                  MAttrib_Get_Type(elem_map_attr) == INT &&
+                  MAttrib_Get_EntDim(elem_map_attr) == MREGION) {
+                int ival = 0;
+                double rval;
+                void *pval;
+                if (MEnt_Get_AttVal(mr,elem_map_attr,&ival,&rval,&pval) &&
+                    ival > 0)
+                  map_id = ival;
+              }
+              elem_map[local_elem_id-1] = map_id;
+            }
           }
         }
       }
