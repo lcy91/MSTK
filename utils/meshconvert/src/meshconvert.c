@@ -98,6 +98,17 @@ static const char *meshconvert_ptype_name(PType ptype) {
   }
 }
 
+static const char *meshconvert_mtype_name(MType mtype) {
+  switch (mtype) {
+  case MVERTEX: return "MVERTEX";
+  case MEDGE: return "MEDGE";
+  case MFACE: return "MFACE";
+  case MREGION: return "MREGION";
+  case MALLTYPE: return "MALLTYPE";
+  default: return "UNKNOWN";
+  }
+}
+
 static int meshconvert_ats_parallel_kind(MEntity_ptr ent) {
 #ifdef MSTK_HAVE_MPI
   return MEnt_PType(ent) == PGHOST ? 1 : 0;
@@ -257,6 +268,103 @@ static int meshconvert_check_column_set(Mesh_ptr mesh, const char *setname,
             setname, global_faces, global_bad, global_repaired);
 
   return global_bad == 0;
+}
+
+static unsigned long long meshconvert_hash_gid(unsigned long long hash,
+                                               int dim, int gid, int ptype) {
+  unsigned long long x = (unsigned long long) (unsigned int) gid;
+  x ^= ((unsigned long long) (unsigned int) dim) << 32;
+  x ^= ((unsigned long long) (unsigned int) ptype) << 48;
+  hash ^= x + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+  return hash;
+}
+
+static int meshconvert_summarize_set(Mesh_ptr mesh, const char *setname,
+                                     int rank, int numprocs, MSTK_Comm comm) {
+  MSet_ptr mset;
+  MEntity_ptr ment;
+  int idx = 0;
+  int local_count = 0, local_nonghost = 0;
+  unsigned long long local_hash = 1469598103934665603ULL;
+  unsigned long long local_nonghost_hash = 1469598103934665603ULL;
+
+  if (!setname || setname[0] == '\0')
+    return 1;
+
+  mset = MESH_MSetByName(mesh,setname);
+  if (!mset) {
+    if (rank == 0)
+      fprintf(stderr,
+              "[meshconvert][summarize-set] set '%s' not found\n",
+              setname);
+    return 0;
+  }
+
+  while ((ment = MSet_Next_Entry(mset,&idx))) {
+    int dim = MEnt_Dim(ment);
+    int gid = MEnt_GlobalID(ment);
+    int ptype = MEnt_PType(ment);
+    local_count++;
+    local_hash = meshconvert_hash_gid(local_hash,dim,gid,ptype);
+    if (ptype != PGHOST) {
+      local_nonghost++;
+      local_nonghost_hash =
+        meshconvert_hash_gid(local_nonghost_hash,dim,gid,ptype);
+    }
+  }
+
+#ifdef MSTK_HAVE_MPI
+  if (comm) {
+    int *counts = NULL, *nonghost_counts = NULL;
+    unsigned long long *hashes = NULL, *nonghost_hashes = NULL;
+    int global_count = 0, global_nonghost = 0;
+
+    if (rank == 0) {
+      counts = (int *) calloc(numprocs,sizeof(int));
+      nonghost_counts = (int *) calloc(numprocs,sizeof(int));
+      hashes = (unsigned long long *)
+        calloc(numprocs,sizeof(unsigned long long));
+      nonghost_hashes = (unsigned long long *)
+        calloc(numprocs,sizeof(unsigned long long));
+    }
+    MPI_Gather(&local_count,1,MPI_INT,counts,1,MPI_INT,0,comm);
+    MPI_Gather(&local_nonghost,1,MPI_INT,nonghost_counts,1,MPI_INT,0,comm);
+    MPI_Gather(&local_hash,1,MPI_UNSIGNED_LONG_LONG,
+               hashes,1,MPI_UNSIGNED_LONG_LONG,0,comm);
+    MPI_Gather(&local_nonghost_hash,1,MPI_UNSIGNED_LONG_LONG,
+               nonghost_hashes,1,MPI_UNSIGNED_LONG_LONG,0,comm);
+
+    if (rank == 0) {
+      int i;
+      fprintf(stderr,
+              "[meshconvert][summarize-set] set '%s' dim=%s ranks=%d\n",
+              setname, meshconvert_mtype_name(MSet_EntDim(mset)), numprocs);
+      for (i = 0; i < numprocs; i++) {
+        global_count += counts[i];
+        global_nonghost += nonghost_counts[i];
+        fprintf(stderr,
+                "[meshconvert][summarize-set] rank=%d count=%d nonghost=%d hash=%016llx nonghost-hash=%016llx\n",
+                i, counts[i], nonghost_counts[i], hashes[i],
+                nonghost_hashes[i]);
+      }
+      fprintf(stderr,
+              "[meshconvert][summarize-set] global count=%d nonghost=%d\n",
+              global_count, global_nonghost);
+      free(counts);
+      free(nonghost_counts);
+      free(hashes);
+      free(nonghost_hashes);
+    }
+  } else
+#endif
+  {
+    fprintf(stderr,
+            "[meshconvert][summarize-set] rank=%d set='%s' count=%d nonghost=%d hash=%016llx nonghost-hash=%016llx\n",
+            rank, setname, local_count, local_nonghost, local_hash,
+            local_nonghost_hash);
+  }
+
+  return 1;
 }
 
 static int meshconvert_verify_column_set(Mesh_ptr mesh, const char *setname,
@@ -493,6 +601,7 @@ int main(int argc, char *argv[]) {
   int experimental_strict_column_partition=0;
   int experimental_preserve_original_element_map=0;
   char verify_column_set[256] = "";
+  char summarize_set[256] = "";
   char repair_column_set[256] = "";
   char repair_sparse_column_set[256] = "";
   char sparse_sideset_source[256] = "";
@@ -501,7 +610,7 @@ int main(int argc, char *argv[]) {
 
   if (argc < 3) {
     fprintf(stderr,"\n");
-    fprintf(stderr,"usage: meshconvert <--timing> <--experimental-skip-side-set-attrs> <--experimental-sparse-set-copy> <--experimental-batched-set-copy> <--experimental-preserve-named-sidesets> <--experimental-sparse-sideset-export> <--experimental-sparse-sideset-source=file> <--experimental-ats-exo-workflow> <--experimental-strict-column-partition> <--experimental-preserve-original-element-map> <--verify-column-set=name> <--repair-column-set=name> <--experimental-repair-sparse-column-set=name> <--classify=0|n|1|y|2> <--partition=y|1|n|0> <--partition-method=0|1|2> <--parallel-check=y|1|n|0> <--weave=y|1|n|0> <--num-ghost-layers=?> <--check-topo=y|1|n|0> infilename outfilename\n\n");
+    fprintf(stderr,"usage: meshconvert <--timing> <--experimental-skip-side-set-attrs> <--experimental-sparse-set-copy> <--experimental-batched-set-copy> <--experimental-preserve-named-sidesets> <--experimental-sparse-sideset-export> <--experimental-sparse-sideset-source=file> <--experimental-ats-exo-workflow> <--experimental-strict-column-partition> <--experimental-preserve-original-element-map> <--summarize-set=name> <--verify-column-set=name> <--repair-column-set=name> <--experimental-repair-sparse-column-set=name> <--classify=0|n|1|y|2> <--partition=y|1|n|0> <--partition-method=0|1|2> <--parallel-check=y|1|n|0> <--weave=y|1|n|0> <--num-ghost-layers=?> <--check-topo=y|1|n|0> infilename outfilename\n\n");
     fprintf(stderr,"partition-method = 0, METIS\n");
     fprintf(stderr,"                 = 1, ZOLTAN with GRAPH partioning\n");
     fprintf(stderr,"                 = 2, ZOLTAN with RCB partitioning\n");
@@ -595,6 +704,10 @@ int main(int argc, char *argv[]) {
       }
       else if (strncmp(argv[i],"--experimental-preserve-original-element-map",44) == 0) {
         experimental_preserve_original_element_map = 1;
+      }
+      else if (strncmp(argv[i],"--summarize-set=",16) == 0) {
+        strncpy(summarize_set, argv[i]+16, sizeof(summarize_set)-1);
+        summarize_set[sizeof(summarize_set)-1] = '\0';
       }
       else if (strncmp(argv[i],"--verify-column-set=",20) == 0) {
         strncpy(verify_column_set, argv[i]+20, sizeof(verify_column_set)-1);
@@ -788,6 +901,10 @@ int main(int argc, char *argv[]) {
       fprintf(stderr,
               "[meshconvert][timing] verify-column-set=%s\n",
               verify_column_set);
+    if (summarize_set[0] != '\0')
+      fprintf(stderr,
+              "[meshconvert][timing] summarize-set=%s\n",
+              summarize_set);
     if (repair_column_set[0] != '\0')
       fprintf(stderr,
               "[meshconvert][timing] repair-column-set=%s\n",
@@ -1217,6 +1334,18 @@ int main(int argc, char *argv[]) {
     if (!ok)
       MSTK_Report("meshconvert",
                   "Sparse column-set repair failed", MSTK_FATAL);
+  }
+
+  if (summarize_set[0] != '\0') {
+    double summarize_t0 = meshconvert_wtime();
+    ok = meshconvert_summarize_set(mesh, summarize_set, rank, numprocs, comm);
+    double summarize_t1 = meshconvert_wtime();
+    if (timing)
+      meshconvert_print_time("summarize-set", summarize_t0, summarize_t1,
+                             rank, comm);
+    if (!ok)
+      MSTK_Report("meshconvert",
+                  "Set summary failed", MSTK_FATAL);
   }
 
   if (verify_column_set[0] != '\0') {
