@@ -88,6 +88,11 @@ static void meshconvert_print_memory(const char *label, int rank, MSTK_Comm comm
     fprintf(stderr, "[meshconvert][memory] %-36s %10.1f MB\n", label, rss);
 }
 
+static int meshconvert_enable_unsafe_ats_exo_workflow(void) {
+  const char *val = getenv("MSTK_ENABLE_UNSAFE_ATS_EXO_WORKFLOW");
+  return (val && val[0] != '\0' && val[0] != '0');
+}
+
 static const char *meshconvert_ptype_name(PType ptype) {
   switch (ptype) {
   case PINTERIOR: return "PINTERIOR";
@@ -888,9 +893,16 @@ int main(int argc, char *argv[]) {
       fprintf(stderr,
               "[meshconvert][timing] experimental-sparse-sideset-source=%s\n",
               sparse_sideset_source);
-    if (experimental_ats_exo_workflow)
-      fprintf(stderr,
-              "[meshconvert][timing] experimental-ats-exo-workflow enabled\n");
+    if (experimental_ats_exo_workflow) {
+      if (meshconvert_enable_unsafe_ats_exo_workflow())
+        fprintf(stderr,
+                "[meshconvert][timing] experimental-ats-exo-workflow enabled "
+                "(unsafe branch explicitly allowed)\n");
+      else
+        fprintf(stderr,
+                "[meshconvert][timing] experimental-ats-exo-workflow requested; "
+                "using stock Exodus partition path for .par equivalence\n");
+    }
     if (experimental_strict_column_partition)
       fprintf(stderr,
               "[meshconvert][timing] experimental-strict-column-partition enabled\n");
@@ -933,7 +945,9 @@ int main(int argc, char *argv[]) {
       if (rank == 0)
 	fprintf(stderr,"Importing mesh from ExodusII file...");
 
-      if (experimental_ats_exo_workflow && partition > 0) {
+      if (experimental_ats_exo_workflow &&
+          meshconvert_enable_unsafe_ats_exo_workflow() &&
+          partition > 0) {
 #ifdef MSTK_HAVE_MPI
         Mesh_ptr serial_mesh = NULL;
         int dim = 0;
