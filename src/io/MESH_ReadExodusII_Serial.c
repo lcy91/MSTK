@@ -1690,6 +1690,7 @@ extern "C" {
         double sideset_t0 = exo_serial_wtime();
         long long total_sideset_entries = 0;
         int min_sideset_size = -1, max_sideset_size = 0;
+        int sideset_ptype_repairs = 0;
 
         if (mesh_type == 3)
           MSTK_Report(funcname,"Cannot handle sidesets in meshes with surface and solid elements",MSTK_FATAL);
@@ -1845,6 +1846,19 @@ extern "C" {
               else {
                 List_ptr fregs;
                 fregs = MF_Regions(mf);
+                /* Parallel Nemesis files can store a boundary side-set face
+                 * as PGHOST even when the side-set element/cell read on this
+                 * rank is owned or overlap. ATS treats PGHOST as unusable for
+                 * local column/surface region logic, so for true boundary
+                 * side-set faces make the face parallel type match the cell
+                 * that supplied the side-set entry. This mirrors the partial
+                 * Exodus reader and is intentionally limited to one-region
+                 * boundary faces. */
+                if (fregs && List_Num_Entries(fregs) == 1 &&
+                    MF_PType(mf) == PGHOST && MR_PType(mr) != PGHOST) {
+                  MF_Set_PType(mf,MR_PType(mr));
+                  sideset_ptype_repairs++;
+                }
                 if (List_Num_Entries(fregs) != 1) {
 #ifdef DEBUG
                   if (MF_GEntID(List_Entry(fregs,0)) == 
@@ -1890,12 +1904,12 @@ extern "C" {
         double sideset_t1 = exo_serial_wtime();
         if (timing)
           fprintf(stderr,
-                  "[meshconvert][timing] %-36s %10.3f s sets=%d entries=%lld min=%d mean=%.1f max=%d\n",
+                  "[meshconvert][timing] %-36s %10.3f s sets=%d entries=%lld min=%d mean=%.1f max=%d ptype-repaired=%d\n",
                   "side-set read/build (3D)", sideset_t1 - sideset_t0,
                   nsidesets, total_sideset_entries,
                   min_sideset_size < 0 ? 0 : min_sideset_size,
                   nsidesets ? ((double) total_sideset_entries)/nsidesets : 0.0,
-                  max_sideset_size);
+                  max_sideset_size, sideset_ptype_repairs);
       }
 
       /* Read element sets */
