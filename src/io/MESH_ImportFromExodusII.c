@@ -438,8 +438,19 @@ extern "C" {
   
   } /* if numprocs > 1 */
   else {
-    if (rank == 0) 
-      return (MESH_ReadExodusII_Serial(mesh,filename,0));
+    mstk_enable_fast_exodus_sets_if_needed(filename, rank, comm, timing);
+
+    if (rank == 0) {
+      double serial_read_t0 = mstk_meshconvert_wtime();
+      int read_status = MESH_ReadExodusII_Serial(mesh,filename,0);
+      double serial_read_t1 = mstk_meshconvert_wtime();
+      if (timing)
+        fprintf(stderr,
+                "[meshconvert][timing] %-36s %10.3f s\n",
+                "rank0 MESH_ReadExodusII_Serial",
+                serial_read_t1 - serial_read_t0);
+      return read_status;
+    }
     else
       return 1;
   }

@@ -56,11 +56,8 @@ extern "C" {
   mtype = MSet_EntDim(gmset);
 
   if (!sparse_copy) {
-    for (i = 0; i < num; ++i) {
+    for (i = 0; i < num; ++i)
       lmset_array[i] = MESH_MSetByName(submeshes[i],msetname);
-      if (!lmset_array[i])
-        lmset_array[i] = MSet_New(submeshes[i],msetname,mtype);
-    }
   }
  
   

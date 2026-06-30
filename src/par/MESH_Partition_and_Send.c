@@ -630,13 +630,14 @@ extern "C" {
         }
       }
       else {
-        for (n = 0; n < num; n++) {
-          torank = toranks[n];
-          if (torank == rank) continue;
+        for (m = 0; m < nset_global; m++) {
 
-          int nset_local = MESH_Num_MSets(submeshes[torank]);
-          for (m = 0; m < nset_local; m++) {
-            mset = MESH_MSet(submeshes[torank],m);
+          for (n = 0; n < num; n++) {
+            torank = toranks[n];
+            if (torank == rank) continue;
+
+            mset = MESH_MSetByName(submeshes[torank],msetnames[m]);
+            if (!mset) continue; /* this mset does not exist on this processor */
 
             MESH_Send_MSet(submeshes[torank], mset, torank, comm,
                            &numreq, &maxreq, &requests,
@@ -652,7 +653,6 @@ extern "C" {
               }
             }
           }
-
         }
       }
       t1 = MPI_Wtime();
