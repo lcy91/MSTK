@@ -61,6 +61,61 @@ extern "C" {
       fprintf(stderr, "[meshconvert][timing] %-36s %10.3f s\n", label, dt);
   }
 
+  static int mstk_env_enabled(const char *name) {
+    const char *val = getenv(name);
+    return val && val[0] != '\0' && val[0] != '0';
+  }
+
+  static int mstk_exodus_fast_set_threshold(void) {
+    const char *val = getenv("MSTK_ATS_FAST_EXO_SET_THRESHOLD");
+    int threshold = val ? atoi(val) : 1000;
+    return threshold > 0 ? threshold : 1000;
+  }
+
+#ifdef MSTK_HAVE_MPI
+  static void mstk_enable_fast_exodus_sets_if_needed(const char *filename,
+                                                     int rank,
+                                                     MSTK_Comm comm,
+                                                     int timing) {
+    int set_count = 0;
+    int threshold = mstk_exodus_fast_set_threshold();
+
+    if (mstk_env_enabled("MSTK_DISABLE_ATS_FAST_EXO_SETS"))
+      return;
+    if (mstk_env_enabled("MSTK_ATS_FAST_EXO_SETS") ||
+        mstk_env_enabled("MSTK_FAST_SET_COPY"))
+      return;
+
+    if (rank == 0) {
+      int exoid, comp_ws = sizeof(double), io_ws = 0, status;
+      float version;
+      ex_init_params params;
+
+      exoid = ex_open(filename, EX_READ, &comp_ws, &io_ws, &version);
+      if (exoid >= 0) {
+        status = ex_get_init_ext(exoid, &params);
+        if (status >= 0)
+          set_count = params.num_side_sets + params.num_elem_sets +
+                      params.num_node_sets + params.num_face_sets +
+                      params.num_edge_sets;
+        ex_close(exoid);
+      }
+    }
+
+    if (comm)
+      MPI_Bcast(&set_count, 1, MPI_INT, 0, comm);
+
+    if (set_count >= threshold) {
+      setenv("MSTK_ATS_FAST_EXO_SETS", "1", 1);
+      if (timing && rank == 0)
+        fprintf(stderr,
+                "[meshconvert][timing] MSTK_ATS_FAST_EXO_SETS auto-enabled "
+                "sets=%d threshold=%d\n",
+                set_count, threshold);
+    }
+  }
+#endif
+
 
   /* Read an Exodus II file into MSTK */
   /* 
@@ -156,6 +211,8 @@ extern "C" {
         
         Mesh_ptr globalmesh;
         int topodim;
+
+        mstk_enable_fast_exodus_sets_if_needed(filename, rank, comm, timing);
         
         if (rank == 0) { /* Read only on processor 0 */
           
